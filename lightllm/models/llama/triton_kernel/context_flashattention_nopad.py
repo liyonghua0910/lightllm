@@ -129,11 +129,12 @@ elif triton.__version__ == "2.0.0":
     def _fwd_kernel(
         Q, K, V, sm_scale, B_Start_Loc, B_Seqlen,
         TMP,  # NOTE: TMP is a scratchpad buffer to workaround a compiler bug
-        Out,
+        QK, Out,
         stride_qbs, stride_qh, stride_qd,
         stride_kbs, stride_kh, stride_kd,
         stride_vbs, stride_vh, stride_vd,
         stride_obs, stride_oh, stride_od,
+        stride_qkbs, stride_qkh, stride_qkm, stride_qkn, 
         stride_tmp_b, stride_tmp_h, stride_tmp_s,
         kv_group_num,
         BLOCK_M: tl.constexpr, BLOCK_DMODEL: tl.constexpr,
@@ -143,20 +144,31 @@ elif triton.__version__ == "2.0.0":
         cur_head = tl.program_id(1)
         start_m = tl.program_id(2)
         
+        # 服务GQA模型，定位所需的kv_head
         cur_kv_head = cur_head // kv_group_num
 
+        # 获取当前 序列 的长度
         cur_batch_seq_len = tl.load(B_Seqlen + cur_batch)
+        # 获取当前 序列 在 token_buffer 中的起始位置
         cur_batch_in_all_start_index = tl.load(B_Start_Loc + cur_batch)
 
+        # 获取当前 片段 在 序列 中的相对起始位置
         block_start_loc = BLOCK_M * start_m
 
         # initialize offsets
+        # 一个数组 0,1,...,BLOCK_N
         offs_n = tl.arange(0, BLOCK_N)
+        # 一个数组 0,1,...,BLOCK_DMODEL
         offs_d = tl.arange(0, BLOCK_DMODEL)
+        # 当前 片段 所有 token 在 序列 中的相对起始位置 (数组)
         offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        # 当前 查询片段 当前 head 的 q 向量
         off_q = (cur_batch_in_all_start_index + offs_m[:, None]) * stride_qbs + cur_head * stride_qh + offs_d[None, :] * stride_qd
+        # 当前 被查询片段 当前 head 的 k 向量 转置
         off_k = offs_n[None, :] * stride_kbs + cur_kv_head * stride_kh + offs_d[:, None] * stride_kd
+        # 当前 被查询片段 当前 head 的 v 向量
         off_v = offs_n[:, None] * stride_vbs + cur_kv_head * stride_vh + offs_d[None, :] * stride_vd
+        # 载入 q 向量
         q = tl.load(Q + off_q, mask=offs_m[:, None] < cur_batch_seq_len, other=0.0)
 
         k_ptrs = K + off_k
@@ -180,6 +192,10 @@ elif triton.__version__ == "2.0.0":
             qk += tl.dot(q, k)
             qk *= sm_scale
             qk = tl.where(offs_m[:, None] >= (start_n + offs_n[None, :]), qk, float("-inf"))
+
+            # 将 scaled attention score 保存下来, 供 H2O 用. 为什么不保存 softmax 的结果? 因为 flash-attention 算法并不会生成正确的 similarity, 只有最后一列 KV Block 才会有正确的 m 和 l
+            qk_offset = cur_batch * stride_qkbs + cur_head * stride_qkh + offs_m[:, None] * stride_qkm + (start_n + offs_n[None, :]) * stride_qkn
+            tl.store(QK + qk_offset, qk, mask=(offs_m[:, None] < cur_batch_seq_len) & (start_n + offs_n[None, :] < cur_batch_seq_len) & (offs_m[:, None] >= start_n + offs_n[None, :]))
 
             m_ij = tl.max(qk, 1)
             p = tl.exp(qk - m_ij[:, None])
@@ -215,7 +231,7 @@ elif triton.__version__ == "2.0.0":
         return
 
     @torch.no_grad()
-    def context_attention_fwd(q, k, v, o, b_start_loc, b_seq_len, max_input_len):
+    def context_attention_fwd(q, k, v, qk, o, b_start_loc, b_seq_len, max_input_len):
         BLOCK = 128
         # shape constraints
         Lq, Lk, Lv = q.shape[-1], k.shape[-1], v.shape[-1]
@@ -234,11 +250,12 @@ elif triton.__version__ == "2.0.0":
         _fwd_kernel[grid](
             q, k, v, sm_scale, b_start_loc, b_seq_len,
             tmp,
-            o,
+            qk, o,
             q.stride(0), q.stride(1), q.stride(2),
             k.stride(0), k.stride(1), k.stride(2),
             v.stride(0), v.stride(1), v.stride(2),
             o.stride(0), o.stride(1), o.stride(2),
+            qk.stride(0), qk.stride(1), qk.stride(2), qk.stride(3),
             tmp.stride(0), tmp.stride(1), tmp.stride(2),
             kv_group_num=kv_group_num,
             BLOCK_M=BLOCK,
@@ -267,10 +284,10 @@ def torch_att(xq, xk, xv, bs, seqlen, num_head, head_dim):
     xq = xq.transpose(1, 2)
     keys = keys.transpose(1, 2)
     values = values.transpose(1, 2)
-    scores = torch.matmul(xq, keys.transpose(2, 3)) / math.sqrt(head_dim)
-    scores = F.softmax(scores.float() + mask, dim=-1).type_as(xq)
+    qk = torch.matmul(xq, keys.transpose(2, 3)) / math.sqrt(head_dim)
+    scores = F.softmax(qk.float() + mask, dim=-1).type_as(xq)
     output = torch.matmul(scores, values).transpose(1, 2).contiguous().reshape(-1, num_head, head_dim)
-    return output
+    return output, torch.where(mask==1, qk, float("-inf"))
 
 
 def test():
@@ -283,8 +300,7 @@ def test():
     k = torch.empty((Z * N_CTX, H, D_HEAD), dtype=dtype, device="cuda").normal_(mean=0.4, std=0.2)
     v = torch.empty((Z * N_CTX, H, D_HEAD), dtype=dtype, device="cuda").normal_(mean=0.3, std=0.2)
     o = torch.empty((Z * N_CTX, H, D_HEAD), dtype=dtype, device="cuda").normal_(mean=0.3, std=0.2)
-
-    max_input_len = N_CTX
+    
     Z = 4
     b_start_loc = torch.zeros((Z,), dtype=torch.int32, device="cuda")
     b_seq_len = torch.ones((Z,), dtype=torch.int32, device="cuda")
@@ -297,17 +313,33 @@ def test():
     for i in range(1, Z):
         b_start_loc[i] = b_start_loc[i - 1] + b_seq_len[i - 1]
 
+    ### Torch Kernel
+    torch_qk_pad = torch.zeros((Z, H, N_CTX, N_CTX), device=q.device, dtype=dtype)
     torch_out = []
     start = 0
     for i in range(Z):
         end = start + b_seq_len[i]
-        torch_o = torch_att(q[start:end], k[start:end], v[start:end], 1, b_seq_len[i], H, D_HEAD)
+        torch_o, torch_qk = torch_att(q[start:end], k[start:end], v[start:end], 1, b_seq_len[i], H, D_HEAD)
         start = end
         torch_out.append(torch_o)
+        torch_qk_pad[i, :, :torch_qk.shape[-2], :torch_qk.shape[-1]] = torch_qk
     torch_out = torch.cat(torch_out, dim=0)
-    context_attention_fwd(q, k, v, o, b_start_loc, b_seq_len, max_input_len)
+    
+    ### Triton Kernel
+    triton_qk = torch.zeros((Z, H, N_CTX, N_CTX), device=q.device, dtype=dtype)
+    context_attention_fwd(q, k, v, triton_qk, o, b_start_loc, b_seq_len, N_CTX)
+    
+    ### Comparison
+    print(triton_qk)
     print(o.shape, torch_out.shape)
-
-    print("max ", torch.max(torch.abs(torch_out - o)))
-    print("mean ", torch.mean(torch.abs(torch_out - o)))
+    print(triton_qk.shape, torch_qk_pad.shape)
+    triton_qk = torch.where(torch.isinf(triton_qk), 0, triton_qk)
+    torch_qk_pad = torch.where(torch.isinf(torch_qk_pad), 0, torch_qk_pad)
+    print('qk diff max', torch.max(torch.abs(triton_qk - torch_qk_pad)))
+    print('qk diff mean', torch.mean(torch.abs(triton_qk - torch_qk_pad)))
+    print("out diff max ", torch.max(torch.abs(torch_out - o)))
+    print("out diff mean ", torch.mean(torch.abs(torch_out - o)))
     assert torch.allclose(torch_out, o, atol=1e-2, rtol=0)
+
+if __name__ == '__main__':
+    test()

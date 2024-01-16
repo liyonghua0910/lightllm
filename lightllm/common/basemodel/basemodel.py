@@ -13,6 +13,8 @@ from lightllm.common.infer_utils import init_req_to_token_indexes
 from lightllm.common.build_utils import repair_config
 from lightllm.common.basemodel.triton_kernel.copy_kv_index_to_req import copy_kv_index_to_req
 from lightllm.common.basemodel.triton_kernel.splitfuse_copy_kv_index_to_req import splitfuse_copy_kv_index_to_req
+if os.getenv('LIGHTLLM_DEBUG') == '1':
+    import debugpy; debugpy.connect(('10.119.7.18', 5678))
 
 torch.backends.cudnn.enabled = True
 
@@ -103,6 +105,10 @@ class TpPartBaseModel:
     def _init_req_manager(self):
         self.req_manager = ReqManager(self.max_req_num, 
                                       self.max_seq_length,
+                                      self.config["n_layer"],
+                                      self.config["num_attention_heads"] // self.world_size_,
+                                      int(os.getenv("REQUEST_CACHE_SIZE", self.max_seq_length)),
+                                      float(os.getenv("REQUEST_CACHE_SPLIT", 0.5)),
                                       self.mem_manager)
         return 
     
@@ -160,6 +166,7 @@ class TpPartBaseModel:
         infer_state.b_req_idx = b_req_idx
         infer_state.b_start_loc = b_start_loc
         infer_state.b_seq_len = b_seq_len
+        infer_state.b_att_len = b_seq_len.clone()
 
         infer_state.mem_manager = self.mem_manager
         infer_state.req_manager = self.req_manager
@@ -181,6 +188,10 @@ class TpPartBaseModel:
         init_req_to_token_indexes(self.req_manager.req_to_token_indexs, b_req_idx, b_seq_len,
                             max_len_in_batch, infer_state.mem_index)
 
+        ## Initialize request states
+        self.req_manager.req_to_atten_indexs[b_req_idx.long()] = 0
+        self.req_manager.req_to_atten_scores[b_req_idx.long()] = 0
+
         infer_state.init_some_extra_state(self, input_ids)
         predict_logics = self._context_forward(input_ids, infer_state)
         return predict_logics
@@ -195,6 +206,7 @@ class TpPartBaseModel:
         infer_state.b_req_idx = b_req_idx
         infer_state.b_start_loc = b_start_loc
         infer_state.b_seq_len = b_seq_len
+        infer_state.b_att_len = torch.min(b_seq_len, torch.ones_like(b_seq_len) * (self.req_manager.cache_size + 1))
         
         infer_state.mem_manager = self.mem_manager
         infer_state.req_manager = self.req_manager

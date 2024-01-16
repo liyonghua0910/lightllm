@@ -1,3 +1,4 @@
+import os
 import torch
 import torch.functional as F
 import torch.distributed as dist
@@ -8,9 +9,9 @@ import triton
 
 from lightllm.models.llama.layer_weights.transformer_layer_weight import LlamaTransformerLayerWeight
 from lightllm.models.llama.triton_kernel.context_flashattention_nopad import context_attention_fwd
-from lightllm.models.llama.triton_kernel.token_attention_nopad_att1 import token_att_fwd, token_att_fwd_int8k
+from lightllm.models.llama.triton_kernel.token_attention_nopad_att1 import token_att_fwd, token_att_fwd_h2o, token_att_fwd_int8k
 from lightllm.models.llama.triton_kernel.token_attention_nopad_softmax import token_softmax_fwd
-from lightllm.models.llama.triton_kernel.token_attention_nopad_reduceV import token_att_fwd2, token_att_fwd2_int8v
+from lightllm.models.llama.triton_kernel.token_attention_nopad_reduceV import token_att_fwd2, token_att_fwd2_h2o, token_att_fwd2_int8v
 from lightllm.models.llama.triton_kernel.rmsnorm import rmsnorm_forward
 from lightllm.models.llama.triton_kernel.rotary_emb import rotary_emb_fwd
 
@@ -19,6 +20,8 @@ from lightllm.models.llama.splitfuse_infer_struct import SplitFuseInferStateInfo
 from lightllm.common.basemodel.triton_kernel.destindex_copy_kv import destindex_copy_kv, destindex_copy_quantize_kv
 from lightllm.common.basemodel import TransformerLayerInferTpl
 from lightllm.models.llama.triton_kernel.splitfuse_context_flashattention_nopad import splitfuse_context_attention_fwd, splitfuse_context_attention_fwd_int8kv
+if os.getenv('LIGHTLLM_DEBUG') == '1':
+    import debugpy; debugpy.connect(('10.119.7.18', 5678))
 
 class LlamaTransformerLayerInfer(TransformerLayerInferTpl):
     """
@@ -70,6 +73,10 @@ class LlamaTransformerLayerInfer(TransformerLayerInferTpl):
             self._token_attention_kernel = partial(LlamaTransformerLayerInfer._token_decode_attention_normal, self)
             self._copy_kv_to_mem_cache = partial(LlamaTransformerLayerInfer._copy_kv_to_mem_cache_normal, self)
         
+        # H2O
+        if os.getenv('ENABLE_HEAVY_HITTER_ORACLE') == '1':
+            self._token_attention_kernel = partial(LlamaTransformerLayerInfer._token_decode_attention_h2o, self)
+
         # bind splitfuse attention
         if "triton_int8kv" in self.mode:
             self._splitfuse_attention_kernel = partial(LlamaTransformerLayerInfer._splitfuse_attention_kernel_int8kv, self)
@@ -93,17 +100,35 @@ class LlamaTransformerLayerInfer(TransformerLayerInferTpl):
                     out=cache_v.view(-1, self.tp_v_head_num_ * self.head_dim_))
         return q, cache_k, cache_v
     
-    def _context_attention_kernel(self, q, k, v, infer_state:LlamaInferStateInfo, layer_weight, out=None)->torch.Tensor:
+    def _context_attention_kernel(self, q, k, v, infer_state:LlamaInferStateInfo, layer_weight, out=None, return_att_score=False)->torch.Tensor:
         o_tensor = torch.empty_like(q) if out is None else out
+        max_seq_len = torch.max(infer_state.b_seq_len)
+        b_scaled_qk = torch.empty(infer_state.batch_size, self.tp_q_head_num_, max_seq_len, max_seq_len, dtype=torch.float16, device='cuda')
+        b_att_score = torch.empty(infer_state.batch_size, self.tp_q_head_num_, max_seq_len, dtype=torch.float16, device='cuda')
         context_attention_fwd(q.view(-1, self.tp_q_head_num_, self.head_dim_),
                               k.view(-1, self.tp_k_head_num_, self.head_dim_),
                               v.view(-1, self.tp_v_head_num_, self.head_dim_),
+                              b_scaled_qk,
                               o_tensor.view(-1, self.tp_q_head_num_, self.head_dim_),
                               infer_state.b_start_loc,
                               infer_state.b_seq_len,
                               infer_state.max_len_in_batch)
-        return o_tensor
-    
+
+        # 将返回的 scaled qk dot 结果转换为注意力分数 A=softmax(QK)
+        for i in range(infer_state.batch_size):
+            seq_len = infer_state.b_seq_len[i]
+            req_idx = infer_state.b_req_idx[i]
+            scaled_qk = b_scaled_qk[i, :, :seq_len, :seq_len]
+            rows, cols = torch.triu_indices(seq_len, seq_len, offset=1)
+            scaled_qk[..., rows, cols] = -torch.inf
+            att_score = torch.softmax(scaled_qk, dim=2).sum(dim=1)
+            b_att_score[i, :, :seq_len] = att_score
+
+        if return_att_score:
+            return b_att_score, o_tensor
+        else:
+            return o_tensor
+
     def _splitfuse_attention_kernel(self, q, infer_state: SplitFuseInferStateInfo, layer_weight, out=None) -> torch.Tensor:
         o_tensor = torch.empty_like(q) if out is None else out
         infer_state.start_event.record(torch.cuda.default_stream())
@@ -207,7 +232,7 @@ class LlamaTransformerLayerInfer(TransformerLayerInferTpl):
                                     mem_manager.value_buffer[self.layer_num_],
                                     mem_manager.value_scale_buffer[self.layer_num_])
         return
-    
+
     def _token_decode_attention_normal(self, q, infer_state: LlamaInferStateInfo, layer_weight, out=None):
         total_token_num = infer_state.total_token_num
         batch_size = infer_state.batch_size
@@ -250,6 +275,86 @@ class LlamaTransformerLayerInfer(TransformerLayerInferTpl):
                                       infer_state.b_seq_len,
                                       infer_state.other_kv_index)
             return o_tensor
+        else:
+            raise Exception("not support triton version")
+    
+    def _token_decode_attention_h2o(self, q, infer_state: LlamaInferStateInfo, layer_weight, out=None, return_att_score=False):
+
+        batch_size = infer_state.batch_size
+        calcu_shape1 = (batch_size, self.tp_q_head_num_, self.head_dim_)
+
+        ### 现在已经删掉了不重要的tokens，我们需要构造一个假环境, 让token attention kernel以为缩减后的序列就是全部的可见序列
+        fake_b_req_idx = torch.arange(batch_size, device="cuda")
+        fake_b_seq_len = torch.empty_like(infer_state.b_att_len)
+        fake_max_len_in_batch = infer_state.b_att_len.max().item()
+        fake_req_to_token_indexs = torch.zeros((batch_size, self.tp_k_head_num_, fake_max_len_in_batch), dtype=torch.int32, device="cuda")
+        for i in range(batch_size):
+            req_idx = infer_state.b_req_idx[i]
+            att_len = infer_state.b_att_len[i]
+            seq_len = infer_state.b_seq_len[i]
+            atten_token_idxs = torch.concat((
+                infer_state.req_manager.req_to_atten_indexs[req_idx, self.layer_num_, :, :att_len-1],                   # cached tokens
+                infer_state.req_manager.req_to_token_indexs[req_idx, seq_len-1:seq_len].repeat(self.tp_k_head_num_,1),  # query token
+            ), dim=1)
+            fake_req_to_token_indexs[i,:,:atten_token_idxs.shape[-1]] = atten_token_idxs
+            fake_b_seq_len[i] = atten_token_idxs.shape[-1]
+
+        # 同时构造假环境中的各项参数
+        fake_b_start_loc = torch.cumsum(fake_b_seq_len, dim=-1) - fake_b_seq_len
+        fake_total_token_num = fake_b_seq_len.sum().item()
+        fake_att_m_tensor = torch.empty((self.tp_q_head_num_, fake_total_token_num), dtype=q.dtype, device="cuda")
+        fake_b_att_score = torch.empty(batch_size, self.tp_q_head_num_, fake_max_len_in_batch, dtype=torch.float16, device='cuda')
+
+        token_att_fwd_h2o(
+            q.view(calcu_shape1),
+            infer_state.mem_manager.key_buffer[self.layer_num_],
+            fake_att_m_tensor,
+            fake_req_to_token_indexs,     # infer_state.req_manager.req_to_token_indexs,
+            fake_b_req_idx,               # infer_state.b_req_idx,
+            fake_b_start_loc,             # infer_state.b_start_loc,
+            fake_b_seq_len,               # infer_state.b_seq_len,
+            fake_max_len_in_batch,        # infer_state.max_len_in_batch
+        )
+
+        o_tensor = torch.empty_like(q) if out is None else out
+
+        # 将返回的 qk_dot 结果转换为注意力分数
+        for i in range(batch_size):
+            start = fake_b_start_loc[i]
+            att_len = fake_b_seq_len[i]
+            scaled_qk = fake_att_m_tensor[:, start:start+att_len]
+            att_score = torch.softmax(scaled_qk, dim=1)
+            fake_b_att_score[i, :, :att_len] = att_score
+
+        if triton.__version__ == "2.0.0":
+            prob = torch.empty_like(fake_att_m_tensor)
+            token_softmax_fwd(fake_att_m_tensor, fake_b_start_loc, fake_b_seq_len, prob, fake_max_len_in_batch)
+            fake_att_m_tensor = None
+            token_att_fwd2_h2o(
+                prob,
+                infer_state.mem_manager.value_buffer[self.layer_num_],
+                o_tensor.view(calcu_shape1),
+                fake_req_to_token_indexs, # infer_state.req_manager.req_to_token_indexs,
+                fake_b_req_idx, # infer_state.b_req_idx,
+                fake_b_start_loc, # infer_state.b_start_loc,
+                fake_b_seq_len, # infer_state.b_seq_len
+            )
+            prob = None
+            if return_att_score:
+                return fake_b_att_score, o_tensor
+            else:
+                return o_tensor
+        # elif triton.__version__ >= "2.1.0":
+        #     from lightllm.models.llama.triton_kernel.token_attention_softmax_and_reducev import token_softmax_reducev_fwd
+        #     token_softmax_reducev_fwd(att_m_tensor, 
+        #                               infer_state.mem_manager.value_buffer[self.layer_num_],
+        #                               o_tensor.view(calcu_shape1),
+        #                               infer_state.req_manager.req_to_token_indexs,
+        #                               infer_state.b_req_idx,
+        #                               infer_state.b_start_loc,
+        #                               infer_state.b_seq_len,
+        #                               infer_state.other_kv_index)
+        #     return o_tensor
         else:
             raise Exception("not support triton version")
     

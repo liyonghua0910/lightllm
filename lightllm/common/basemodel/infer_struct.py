@@ -13,6 +13,7 @@ class InferStateInfo:
         self.b_req_idx = None
         self.b_start_loc = None
         self.b_seq_len = None
+        self.b_att_len = None
         self.max_len_in_batch = None
         self.is_prefill = None
         

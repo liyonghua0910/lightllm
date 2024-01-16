@@ -2,13 +2,21 @@ import torch
 from lightllm.utils.log_utils import init_logger
 
 logger = init_logger(__name__)
-    
+
 class ReqManager:
-    def __init__(self, max_request_num, max_sequence_length, mem_manager):
+    def __init__(self, max_request_num, max_sequence_length, layers_num, att_head_num, cache_size, cache_split, mem_manager):
         self.req_state = torch.zeros((max_request_num,), dtype=torch.bool, device="cuda")
         self.req_to_token_indexs = torch.zeros((max_request_num, max_sequence_length), dtype=torch.int32, device="cuda")
         self.can_use_req_size = max_request_num
         self.mem_manager = mem_manager
+        
+        # req states maintained for kv cache compression
+        self.cache_size = cache_size
+        self.max_heavy_hitters_num = int(cache_size * cache_split)
+        self.local_tokens_num = cache_size - self.max_heavy_hitters_num
+        self.req_to_atten_indexs = torch.zeros((max_request_num, layers_num, att_head_num, self.cache_size), dtype=torch.int32, device="cuda")
+        self.req_to_atten_scores = torch.zeros((max_request_num, layers_num, att_head_num, self.cache_size), dtype=torch.float16, device="cuda")
+        self.req_to_used_cache = torch.zeros((max_request_num), dtype=torch.int32, device="cuda")
 
     def alloc(self, need_size):
         if need_size > self.can_use_req_size:
