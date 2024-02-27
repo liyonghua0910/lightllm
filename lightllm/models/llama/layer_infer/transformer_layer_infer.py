@@ -20,8 +20,14 @@ from lightllm.models.llama.splitfuse_infer_struct import SplitFuseInferStateInfo
 from lightllm.common.basemodel.triton_kernel.destindex_copy_kv import destindex_copy_kv, destindex_copy_quantize_kv
 from lightllm.common.basemodel import TransformerLayerInferTpl
 from lightllm.models.llama.triton_kernel.splitfuse_context_flashattention_nopad import splitfuse_context_attention_fwd, splitfuse_context_attention_fwd_int8kv
-if os.getenv('LIGHTLLM_DEBUG') == '1':
-    import debugpy; debugpy.connect(('10.119.7.18', 5678))
+
+# if os.getenv('LIGHTLLM_DEBUG') == '1':
+#     import debugpy; debugpy.connect(('10.119.39.56', 5678))
+
+import logging
+from lightllm.utils.log_utils import init_logger
+logger = init_logger(__name__)
+logger.setLevel(logging.DEBUG if os.getenv('LIGHTLLM_DEBUG')=='1' else logging.INFO)
 
 class LlamaTransformerLayerInfer(TransformerLayerInferTpl):
     """

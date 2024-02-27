@@ -13,8 +13,8 @@ from lightllm.common.infer_utils import init_req_to_token_indexes
 from lightllm.common.build_utils import repair_config
 from lightllm.common.basemodel.triton_kernel.copy_kv_index_to_req import copy_kv_index_to_req
 from lightllm.common.basemodel.triton_kernel.splitfuse_copy_kv_index_to_req import splitfuse_copy_kv_index_to_req
-if os.getenv('LIGHTLLM_DEBUG') == '1':
-    import debugpy; debugpy.connect(('10.119.7.18', 5678))
+# if os.getenv('LIGHTLLM_DEBUG') == '1':
+#     import debugpy; debugpy.connect(('10.119.39.56', 5678))
 
 torch.backends.cudnn.enabled = True
 
@@ -107,8 +107,6 @@ class TpPartBaseModel:
                                       self.max_seq_length,
                                       self.config["n_layer"],
                                       self.config["num_attention_heads"] // self.world_size_,
-                                      int(os.getenv("REQUEST_CACHE_SIZE", self.max_seq_length)),
-                                      float(os.getenv("REQUEST_CACHE_SPLIT", 0.5)),
                                       self.mem_manager)
         return 
     
