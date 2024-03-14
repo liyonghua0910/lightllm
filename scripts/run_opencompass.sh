@@ -2,8 +2,9 @@
 
 source activate /home/mnt/liyonghua1/envs/lightllm
 
-SERVICE_NAME="sink4_top8_local8" # [full_cache | top64_local64 | sink4_top64_local64 | top32_local32 | top16_local16 | top8_local8 | sink4_top8_local8 | top4_local4]
-DATASETS="Xsum" # [mmlu cmmlu agieval triviaqa Xsum humaneval math gsm8k]
+SERVICE_NAME="full_cache" # [full_cache | top64_local64 | sink4_top64_local64 | 
+                                   # top32_local32 | top16_local16 | top8_local8 | sink4_top8_local8 | top4_local4]
+DATASETS="ceval" # [mmlu cmmlu agieval triviaqa Xsum humaneval math gsm8k]
 MODE="all" # [all | infer | eval | viz]
 WORK_DIR="./outputs/myworkspace"
 
@@ -18,7 +19,7 @@ elif [ "$SERVICE_NAME" == "top64_local64" ]; then
     REUSED_DIR="20240118_103914_internlm20b_top64local64"
 elif [ "$SERVICE_NAME" == "sink4_top8_local8" ]; then
     SERVICE_IP="10.119.4.201"
-    REUSED_DIR=""
+    REUSED_DIR="20240227_010953_internlm20b_sink4top8local8"
 elif [ "$SERVICE_NAME" == "top8_local8" ]; then
     SERVICE_IP="10.119.17.70"
     REUSED_DIR="20240129_175629_internlm20b_top8local8"

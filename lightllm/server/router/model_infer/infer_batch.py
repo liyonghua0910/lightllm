@@ -138,13 +138,16 @@ class InferBatch:
     def free_self(self):
         free_req_index = []
         free_token_index = []
+        free_atten_index = []
         for request_id in self.request_ids:
             req : InferReq = requests_mapping.pop(request_id)
             free_req_index.append(req.req_idx)
             free_token_index.append(self.req_manager.req_to_token_indexs[req.req_idx][:req.cur_kv_len])
+            free_atten_index.append(self.req_manager.req_to_atten_indexs[req.req_idx, :, :, :min(self.req_manager.cache_size, req.cur_kv_len)])
             
         free_token_index = torch.cat(free_token_index, dim=-1)
-        self.req_manager.free(free_req_index, free_token_index)
+        free_atten_index = torch.cat(free_atten_index, dim=-1)
+        self.req_manager.free(free_req_index, free_token_index, free_atten_index)
         if len(requests_mapping) == 0:
             requests_mapping.clear()
         return
@@ -164,12 +167,15 @@ class InferBatch:
             )
         free_req_index = []
         free_token_index = []
+        free_atten_index = []
         for request_id in finished_request_ids:
             req : InferReq = requests_mapping.pop(request_id)
             free_req_index.append(req.req_idx)
             free_token_index.append(self.req_manager.req_to_token_indexs[req.req_idx][:req.cur_kv_len])
+            free_atten_index.append(self.req_manager.req_to_atten_indexs[req.req_idx, :, :, :min(self.req_manager.cache_size, req.cur_kv_len)])
         free_token_index = torch.cat(free_token_index, dim=-1)
-        self.req_manager.free(free_req_index, free_token_index)
+        free_atten_index = torch.cat(free_atten_index, dim=-1)
+        self.req_manager.free(free_req_index, free_token_index, free_atten_index)
         
         return InferBatch(
             batch_id=self.batch_id,

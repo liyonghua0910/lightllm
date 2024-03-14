@@ -16,8 +16,8 @@ class ReqManager:
         self.cache_top_size = int(os.getenv("CACHE_TOP_SIZE"))
         self.cache_local_size = int(os.getenv("CACHE_LOCAL_SIZE"))
         self.cache_size = self.cache_sink_size + self.cache_top_size + self.cache_local_size
-        self.req_to_atten_indexs = torch.zeros((max_request_num, layers_num, att_head_num, self.cache_size), dtype=torch.int32, device="cuda")
-        self.req_to_atten_scores = torch.zeros((max_request_num, layers_num, att_head_num, self.cache_size), dtype=torch.float16, device="cuda")
+        self.req_to_atten_indexs = torch.zeros((max_request_num, layers_num, att_head_num, self.cache_size + 1), dtype=torch.int32, device="cuda")
+        self.req_to_atten_scores = torch.zeros((max_request_num, layers_num, att_head_num, self.cache_size + 1), dtype=torch.float16, device="cuda")
         self.req_to_used_cache = torch.zeros((max_request_num), dtype=torch.int32, device="cuda")
 
     def alloc(self, need_size):
@@ -29,12 +29,13 @@ class ReqManager:
         self.can_use_req_size -= len(select_index)
         return select_index
     
-    def free(self, free_req_index, free_token_index):
+    def free(self, free_req_index, free_token_index, free_atten_index=None):
         self.can_use_req_size += len(free_req_index)
         self.req_state[free_req_index] = 0
         if self.can_use_req_size == len(self.req_state):
             logger.debug(f"freed all request size {self.can_use_req_size}")
         self.mem_manager.free(free_token_index)
+        self.mem_manager.free_finegrained(free_atten_index)
     
     def free_req(self, free_req_index):
         self.can_use_req_size +=1

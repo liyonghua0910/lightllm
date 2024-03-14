@@ -9,12 +9,10 @@ from lightllm.common.basemodel.infer_struct import InferStateInfo
 from lightllm.common.basemodel.splitfuse_infer_struct import SplitFuseInferStateInfo
 from lightllm.common.mem_manager import MemoryManager
 from lightllm.common.req_manager import ReqManager
-from lightllm.common.infer_utils import init_req_to_token_indexes
+from lightllm.common.infer_utils import init_req_to_token_indexes, init_req_to_atten_indexes
 from lightllm.common.build_utils import repair_config
 from lightllm.common.basemodel.triton_kernel.copy_kv_index_to_req import copy_kv_index_to_req
 from lightllm.common.basemodel.triton_kernel.splitfuse_copy_kv_index_to_req import splitfuse_copy_kv_index_to_req
-# if os.getenv('LIGHTLLM_DEBUG') == '1':
-#     import debugpy; debugpy.connect(('10.119.39.56', 5678))
 
 torch.backends.cudnn.enabled = True
 
@@ -165,6 +163,9 @@ class TpPartBaseModel:
         infer_state.b_start_loc = b_start_loc
         infer_state.b_seq_len = b_seq_len
         infer_state.b_att_len = b_seq_len.clone()
+        infer_state.b_att_start_loc = torch.cumsum(infer_state.b_att_len, dim=-1) - infer_state.b_att_len
+        infer_state.max_att_len_in_batch = infer_state.b_att_len.max().item()
+        infer_state.total_att_token_num = infer_state.b_att_len.sum().item()
 
         infer_state.mem_manager = self.mem_manager
         infer_state.req_manager = self.req_manager
@@ -186,9 +187,14 @@ class TpPartBaseModel:
         init_req_to_token_indexes(self.req_manager.req_to_token_indexs, b_req_idx, b_seq_len,
                             max_len_in_batch, infer_state.mem_index)
 
-        ## Initialize request states
-        self.req_manager.req_to_atten_indexs[b_req_idx.long()] = 0
-        self.req_manager.req_to_atten_scores[b_req_idx.long()] = 0
+        if os.getenv('ENABLE_CACHE_DROPPING') == '1':
+            # 依然保留原来的分配模式，但在后续处理中忽略，同时也引入新的管理机制的分配模式
+            infer_state.key_buffer = torch.empty((infer_state.total_token_num, self.tp_k_head_num_, self.head_dim_), dtype=torch.float16, device="cuda")
+            infer_state.value_buffer = torch.empty((infer_state.total_token_num, self.tp_v_head_num_, self.head_dim_), dtype=torch.float16, device="cuda")  # 临时缓冲区，用于存放全序列的k/v值
+            b_cache_usage = torch.min(b_seq_len, torch.ones_like(b_seq_len) * self.req_manager.cache_size)
+            infer_state.finegrained_mem_index = self.mem_manager.alloc_finegrained(b_cache_usage.sum())  # 只为每条序列分配压缩后的缓存空间，分配的token数必须与最终选出的token数匹配
+            init_req_to_atten_indexes(self.req_manager.req_to_atten_indexs, self.req_manager.req_to_atten_scores,
+                                    b_req_idx, b_cache_usage, max_len_in_batch, infer_state.finegrained_mem_index)
 
         infer_state.init_some_extra_state(self, input_ids)
         predict_logics = self._context_forward(input_ids, infer_state)
@@ -205,6 +211,9 @@ class TpPartBaseModel:
         infer_state.b_start_loc = b_start_loc
         infer_state.b_seq_len = b_seq_len
         infer_state.b_att_len = torch.min(b_seq_len, torch.ones_like(b_seq_len) * (self.req_manager.cache_size + 1))
+        infer_state.b_att_start_loc = torch.cumsum(infer_state.b_att_len, dim=-1) - infer_state.b_att_len
+        infer_state.max_att_len_in_batch = infer_state.b_att_len.max().item()
+        infer_state.total_att_token_num = infer_state.b_att_len.sum().item()
         
         infer_state.mem_manager = self.mem_manager
         infer_state.req_manager = self.req_manager
@@ -223,6 +232,16 @@ class TpPartBaseModel:
             infer_state.key_buffer = torch.empty((batch_size, self.tp_k_head_num_, self.head_dim_), dtype=torch.float16, device="cuda")
             infer_state.value_buffer = torch.empty((batch_size, self.tp_v_head_num_, self.head_dim_), dtype=torch.float16, device="cuda")
             copy_kv_index_to_req(self.req_manager.req_to_token_indexs, b_req_idx, b_seq_len, infer_state.mem_index)
+
+        if os.getenv('ENABLE_CACHE_DROPPING') == '1':
+            # 依然保留原来的分配模式，但在后续处理中忽略，同时也引入新的管理机制的分配模式
+            infer_state.finegrained_mem_index = self.mem_manager.alloc_finegrained(batch_size)
+            infer_state.key_buffer = torch.empty((batch_size, self.tp_k_head_num_, self.head_dim_), dtype=torch.float16, device="cuda")
+            infer_state.value_buffer = torch.empty((batch_size, self.tp_v_head_num_, self.head_dim_), dtype=torch.float16, device="cuda")  # 临时缓冲区，用于存放全序列的k/v值
+            for i in range(batch_size):
+                req_idx = b_req_idx[i]
+                att_len = infer_state.b_att_len[i]
+                self.req_manager.req_to_atten_indexs[req_idx,:,:,att_len-1] = infer_state.finegrained_mem_index[:,:,i]
 
         infer_state.init_some_extra_state(self, input_ids)
         predict_logics = self._token_forward(input_ids, infer_state)

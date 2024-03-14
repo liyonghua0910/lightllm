@@ -15,6 +15,7 @@ class MemoryManager:
         
         # mem_state 修改为使用计数方式，方便后期实现token共享机制，实现beam search 等
         self.mem_state = torch.zeros((size,), dtype=torch.int32, device="cuda")
+        self.finegrained_mem_state = torch.zeros((layer_num, head_num, size), dtype=torch.int8, device="cuda")  # 0/1
         self.indexes = torch.arange(0, size, dtype=torch.long, device="cuda")
         self.can_use_mem_size = size
         self._init_buffers(size, dtype, head_num, head_dim, layer_num)
@@ -26,7 +27,54 @@ class MemoryManager:
     def _free_buffers(self):
         self.key_buffer = None
         self.value_buffer = None
+
+    @torch.no_grad()
+    def alloc_finegrained(self, need_size):
+        """ Allocate need_size memory from cache in a fine-grained manner.
+            Memory state is indexed by (layer_idx, head_idx, token_idx).
+            Returns a tensor shaped (layer_num, head_num, need_size).
+        """
+        if (need_size > (self.finegrained_mem_state == 0).sum(-1)).any():
+            logger.warn(f'warn no enough cache size ({need_size}) in head!')
+            return None
+        alloc_idx = self.finegrained_mem_state.sort(dim=-1, descending=False, stable=True).indices[:,:,:need_size]
+        layer_idx = torch.arange(self.layer_num).repeat(self.head_num * need_size, 1).t().flatten().cuda()
+        head_idx = torch.arange(self.head_num).repeat(need_size, 1).t().flatten().repeat(self.layer_num).cuda()
+        self.finegrained_mem_state[layer_idx, head_idx, alloc_idx.flatten()] += 1
+        return alloc_idx
+
+    @torch.no_grad()
+    def free_finegrained_by_index(self, free_index_list):
+        """ Free memory from cache in a fine-grained manner.
+            Memory needed to be freed is specified by `free_index_list` tensor shaped (?, 3) 
+            with each row looking like [layer_idx, head_idx, token_idx]
+        """
+        free_index = free_index_list.long().t().tolist()
+        self.finegrained_mem_state[free_index] -= 1
+        return
+
+    @torch.no_grad()
+    def free_finegrained(self, free_index):
+        """ Free memory from cache in a fine-grained manner.
+            Memory needed to be freed is specified by `free_index` tensor shaped (layer_num, head_num, ?) 
+            with the last dim specifying token indices to be freed in each head
+        """
+        if free_index == None:
+            return
+        layer_num, head_num, free_size = free_index.shape
+        assert layer_num == self.layer_num and head_num == self.head_num
+        layer_idx = torch.arange(layer_num).repeat(head_num * free_size, 1).t().flatten().cuda()
+        head_idx = torch.arange(head_num).repeat(free_size, 1).t().flatten().repeat(self.layer_num).cuda()
+        self.finegrained_mem_state[layer_idx, head_idx, free_index.long().flatten()] -= 1
+        return
     
+    @torch.no_grad()
+    def get_memory_usage(self, layer_id, head_id):
+        used_mem = (self.finegrained_mem_state[layer_id, head_id] == 1).sum(-1).item()
+        remained_mem = (self.finegrained_mem_state[layer_id, head_id] == 0).sum(-1).item()
+        abnormal_mem_index = torch.stack(torch.where((self.finegrained_mem_state!=0)&(self.finegrained_mem_state!=1)), -1).cpu().numpy().tolist()
+        return used_mem, remained_mem, abnormal_mem_index
+
     @torch.no_grad()
     def alloc(self, need_size):
         if need_size > self.can_use_mem_size:
@@ -93,6 +141,7 @@ class MemoryManager:
     def free_all(self):
         self.can_use_mem_size = len(self.mem_state)
         self.mem_state[:] = 0
+        self.finegrained_mem_state[:] = 0
     
     @torch.no_grad()
     def resize_mem(self, new_size):
@@ -112,3 +161,17 @@ class MemoryManager:
         self._free_buffers()
         self._init_buffers(size, dtype, head_num, head_dim, layer_num)
         return
+
+
+if __name__ == "__main__":
+    # Test fine-grained memory management
+    mem_manager = MemoryManager(10, torch.float16, 4, 8, 2)
+    print(mem_manager.finegrained_mem_state)
+    mem_index = mem_manager.alloc_finegrained(3)
+    print(mem_manager.finegrained_mem_state)
+    mem_index = mem_manager.alloc_finegrained(10)
+    print(mem_manager.finegrained_mem_state)
+    free_index = torch.tensor([[0,0,0], [0,0,1], [0,0,2], [0,1,2], [0,1,0], [0,2,1]]).cuda()
+    mem_index = mem_manager.free_finegrained_by_index(free_index)
+    print(mem_manager.finegrained_mem_state)
+    mem_index = mem_manager.alloc_finegrained(3)

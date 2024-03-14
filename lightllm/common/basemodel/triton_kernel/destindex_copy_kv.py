@@ -52,6 +52,48 @@ def destindex_copy_kv(K, DestLoc, Out):
 
 
 @triton.jit
+def _fwd_kernel_destindex_copy_kv_finegrained(
+    K, Dest_loc,
+    Out,
+    stride_k_bs, stride_k_h, stride_k_d,
+    stride_destloc_h, stride_destloc_n,
+    stride_o_bs, stride_o_h, stride_o_d,
+    BLOCK_DMODEL: tl.constexpr,
+):
+    cur_index = tl.program_id(0)
+    cur_head = tl.program_id(1)
+
+    offs_d = tl.arange(0, BLOCK_DMODEL)
+    dest_index = tl.load(Dest_loc + cur_head * stride_destloc_h + cur_index * stride_destloc_n)
+    k_ptrs = K + cur_index * stride_k_bs + cur_head * stride_k_h + offs_d * stride_k_d
+    o_ptrs = Out + dest_index * stride_o_bs + cur_head * stride_o_h + offs_d * stride_o_d
+
+    k = tl.load(k_ptrs)
+    tl.store(o_ptrs, k)
+    return
+
+
+def destindex_copy_kv_finegrained(K, DestLoc, Out):
+    head_num, seq_len = DestLoc.shape
+    seq_len, head_num, head_dim = K.shape
+    assert K.shape[0] == DestLoc.shape[1] and K.shape[1] == DestLoc.shape[0] 
+    assert K.shape[1] == Out.shape[1] and K.shape[2] == Out.shape[2]
+    grid = (seq_len, head_num)
+    num_warps = 1
+
+    _fwd_kernel_destindex_copy_kv_finegrained[grid](
+        K, DestLoc, Out,
+        K.stride(0), K.stride(1), K.stride(2),
+        DestLoc.stride(0), DestLoc.stride(1),
+        Out.stride(0), Out.stride(1), Out.stride(2),
+        BLOCK_DMODEL=head_dim,
+        num_warps=num_warps,
+        num_stages=1,
+    )
+    return
+
+
+@triton.jit
 def _fwd_kernel_destindex_copy_quantize_kv(
     K, Dest_loc, Out, Out_scale,
     stride_k_bs, stride_k_h, stride_k_d,

@@ -21,13 +21,8 @@ from lightllm.common.basemodel.triton_kernel.destindex_copy_kv import destindex_
 from lightllm.common.basemodel import TransformerLayerInferTpl
 from lightllm.models.llama.triton_kernel.splitfuse_context_flashattention_nopad import splitfuse_context_attention_fwd, splitfuse_context_attention_fwd_int8kv
 
-# if os.getenv('LIGHTLLM_DEBUG') == '1':
-#     import debugpy; debugpy.connect(('10.119.39.56', 5678))
-
-import logging
 from lightllm.utils.log_utils import init_logger
 logger = init_logger(__name__)
-logger.setLevel(logging.DEBUG if os.getenv('LIGHTLLM_DEBUG')=='1' else logging.INFO)
 
 class LlamaTransformerLayerInfer(TransformerLayerInferTpl):
     """
@@ -80,7 +75,7 @@ class LlamaTransformerLayerInfer(TransformerLayerInferTpl):
             self._copy_kv_to_mem_cache = partial(LlamaTransformerLayerInfer._copy_kv_to_mem_cache_normal, self)
         
         # H2O
-        if os.getenv('ENABLE_HEAVY_HITTER_ORACLE') == '1':
+        if os.getenv('ENABLE_CACHE_DROPPING') == '1':
             self._token_attention_kernel = partial(LlamaTransformerLayerInfer._token_decode_attention_h2o, self)
 
         # bind splitfuse attention
@@ -289,65 +284,46 @@ class LlamaTransformerLayerInfer(TransformerLayerInferTpl):
         batch_size = infer_state.batch_size
         calcu_shape1 = (batch_size, self.tp_q_head_num_, self.head_dim_)
 
-        ### 现在已经删掉了不重要的tokens，我们需要构造一个假环境, 让token attention kernel以为缩减后的序列就是全部的可见序列
-        fake_b_req_idx = torch.arange(batch_size, device="cuda")
-        fake_b_seq_len = torch.empty_like(infer_state.b_att_len)
-        fake_max_len_in_batch = infer_state.b_att_len.max().item()
-        fake_req_to_token_indexs = torch.zeros((batch_size, self.tp_k_head_num_, fake_max_len_in_batch), dtype=torch.int32, device="cuda")
-        for i in range(batch_size):
-            req_idx = infer_state.b_req_idx[i]
-            att_len = infer_state.b_att_len[i]
-            seq_len = infer_state.b_seq_len[i]
-            atten_token_idxs = torch.concat((
-                infer_state.req_manager.req_to_atten_indexs[req_idx, self.layer_num_, :, :att_len-1],                   # cached tokens
-                infer_state.req_manager.req_to_token_indexs[req_idx, seq_len-1:seq_len].repeat(self.tp_k_head_num_,1),  # query token
-            ), dim=1)
-            fake_req_to_token_indexs[i,:,:atten_token_idxs.shape[-1]] = atten_token_idxs
-            fake_b_seq_len[i] = atten_token_idxs.shape[-1]
-
-        # 同时构造假环境中的各项参数
-        fake_b_start_loc = torch.cumsum(fake_b_seq_len, dim=-1) - fake_b_seq_len
-        fake_total_token_num = fake_b_seq_len.sum().item()
-        fake_att_m_tensor = torch.empty((self.tp_q_head_num_, fake_total_token_num), dtype=q.dtype, device="cuda")
-        fake_b_att_score = torch.empty(batch_size, self.tp_q_head_num_, fake_max_len_in_batch, dtype=torch.float16, device='cuda')
-
+        ### 缓存索引方式从req_to_token_indexs映射表替换成req_to_atten_indexs映射表
+        att_m_tensor = torch.empty((self.tp_q_head_num_, infer_state.total_att_token_num), dtype=q.dtype, device="cuda")
         token_att_fwd_h2o(
             q.view(calcu_shape1),
             infer_state.mem_manager.key_buffer[self.layer_num_],
-            fake_att_m_tensor,
-            fake_req_to_token_indexs,     # infer_state.req_manager.req_to_token_indexs,
-            fake_b_req_idx,               # infer_state.b_req_idx,
-            fake_b_start_loc,             # infer_state.b_start_loc,
-            fake_b_seq_len,               # infer_state.b_seq_len,
-            fake_max_len_in_batch,        # infer_state.max_len_in_batch
+            att_m_tensor,
+            infer_state.req_manager.req_to_atten_indexs[:, self.layer_num_, :, :],
+            infer_state.b_req_idx,
+            infer_state.b_att_start_loc, 
+            infer_state.b_att_len,
+            infer_state.max_att_len_in_batch,
         )
 
         o_tensor = torch.empty_like(q) if out is None else out
 
         # 将返回的 qk_dot 结果转换为注意力分数
+        b_att_score = torch.empty((batch_size, self.tp_q_head_num_, infer_state.max_att_len_in_batch), dtype=torch.float16, device='cuda')
         for i in range(batch_size):
-            start = fake_b_start_loc[i]
-            att_len = fake_b_seq_len[i]
-            scaled_qk = fake_att_m_tensor[:, start:start+att_len]
+            start = infer_state.b_att_start_loc[i]
+            att_len = infer_state.b_att_len[i]
+            scaled_qk = att_m_tensor[:, start:start+att_len]
             att_score = torch.softmax(scaled_qk, dim=1)
-            fake_b_att_score[i, :, :att_len] = att_score
+            b_att_score[i, :, :att_len] = att_score
 
         if triton.__version__ == "2.0.0":
-            prob = torch.empty_like(fake_att_m_tensor)
-            token_softmax_fwd(fake_att_m_tensor, fake_b_start_loc, fake_b_seq_len, prob, fake_max_len_in_batch)
-            fake_att_m_tensor = None
+            prob = torch.empty_like(att_m_tensor)
+            token_softmax_fwd(att_m_tensor, infer_state.b_att_start_loc, infer_state.b_att_len, prob, infer_state.max_att_len_in_batch)
+            att_m_tensor = None
             token_att_fwd2_h2o(
                 prob,
                 infer_state.mem_manager.value_buffer[self.layer_num_],
                 o_tensor.view(calcu_shape1),
-                fake_req_to_token_indexs, # infer_state.req_manager.req_to_token_indexs,
-                fake_b_req_idx, # infer_state.b_req_idx,
-                fake_b_start_loc, # infer_state.b_start_loc,
-                fake_b_seq_len, # infer_state.b_seq_len
+                infer_state.req_manager.req_to_atten_indexs[:, self.layer_num_, :, :],
+                infer_state.b_req_idx,
+                infer_state.b_att_start_loc, 
+                infer_state.b_att_len,
             )
             prob = None
             if return_att_score:
-                return fake_b_att_score, o_tensor
+                return b_att_score, o_tensor
             else:
                 return o_tensor
         # elif triton.__version__ >= "2.1.0":

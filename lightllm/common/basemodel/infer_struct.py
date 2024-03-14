@@ -10,11 +10,14 @@ class InferStateInfo:
     def __init__(self):
         self.batch_size = None
         self.total_token_num = None
+        self.total_att_token_num = None
         self.b_req_idx = None
         self.b_start_loc = None
+        self.b_att_start_loc = None
         self.b_seq_len = None
         self.b_att_len = None
         self.max_len_in_batch = None
+        self.max_att_len_in_batch = None
         self.is_prefill = None
         
         self.mem_manager: MemoryManager = None
@@ -24,6 +27,7 @@ class InferStateInfo:
         self.mem_index = None
         self.mem_start = None 
         self.mem_end = None
+        self.finegrained_mem_index = None
         self.key_buffer = None
         self.value_buffer = None
 
