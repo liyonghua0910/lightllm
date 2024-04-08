@@ -247,3 +247,36 @@ def token_att_fwd_int8k(q, k, k_scale, att_out, Req_to_tokens, B_req_idx, B_Star
         num_stages=1,
     )
     return
+
+
+def test():
+    batch_size = 1
+    head_num = 10
+    head_dim = 128
+    total_cache_size = 1000
+    seq_cache_size = 65
+    max_seq_num = 100
+    torch.manual_seed(0)
+    q = 0.5 - torch.rand(batch_size, head_num, head_dim, device='cuda', dtype=torch.float16)
+    k = 2 + 2 * torch.rand(total_cache_size, head_num, head_dim, device='cuda', dtype=torch.float16)
+    att_out = torch.zeros(head_num, seq_cache_size * batch_size, device='cuda', dtype=torch.float16)
+    Req_to_tokens = torch.randint(0, total_cache_size, [max_seq_num, head_num, seq_cache_size], device='cuda', dtype=torch.int32)
+    B_req_idx = torch.randint(0, max_seq_num, [batch_size], device='cuda', dtype=torch.int32)
+    B_Seqlen = torch.ones(batch_size, device='cuda', dtype=torch.int32) * seq_cache_size
+    B_Start_Loc = torch.cumsum(B_Seqlen, 0) - B_Seqlen
+    max_len_in_batch = torch.max(B_Seqlen).item()
+    
+    token_att_fwd_h2o(q, k, att_out, Req_to_tokens, B_req_idx, B_Start_Loc, B_Seqlen, max_len_in_batch)
+    
+    batch_idxs = Req_to_tokens[B_req_idx.long()]
+    torch_out = torch.zeros(batch_size, head_num, seq_cache_size, device='cuda', dtype=torch.float16)
+    for b, req_idxs in enumerate(batch_idxs):
+        for h, head_idxs in enumerate(req_idxs):
+            head_q = q[b, h].unsqueeze(0)
+            head_k = k[head_idxs.long(), h]
+            torch_out[b, h] = torch.mm(head_q, head_k.t()) / head_dim ** 0.5
+    torch_out = torch_out.transpose(0,1).view(head_num, -1)
+    print(torch.norm(torch_out-att_out))
+
+if __name__ == '__main__':
+    test()

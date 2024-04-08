@@ -9,7 +9,7 @@ from lightllm.common.basemodel.infer_struct import InferStateInfo
 from lightllm.common.basemodel.splitfuse_infer_struct import SplitFuseInferStateInfo
 from lightllm.common.mem_manager import MemoryManager
 from lightllm.common.req_manager import ReqManager
-from lightllm.common.infer_utils import init_req_to_token_indexes, init_req_to_atten_indexes
+from lightllm.common.infer_utils import init_req_to_token_indexes
 from lightllm.common.build_utils import repair_config
 from lightllm.common.basemodel.triton_kernel.copy_kv_index_to_req import copy_kv_index_to_req
 from lightllm.common.basemodel.triton_kernel.splitfuse_copy_kv_index_to_req import splitfuse_copy_kv_index_to_req
@@ -105,6 +105,7 @@ class TpPartBaseModel:
                                       self.max_seq_length,
                                       self.config["n_layer"],
                                       self.config["num_attention_heads"] // self.world_size_,
+                                      self.config["n_embed"] // self.config["num_attention_heads"],
                                       self.mem_manager)
         return 
     
@@ -162,10 +163,12 @@ class TpPartBaseModel:
         infer_state.b_req_idx = b_req_idx
         infer_state.b_start_loc = b_start_loc
         infer_state.b_seq_len = b_seq_len
-        infer_state.b_att_len = b_seq_len.clone()
-        infer_state.b_att_start_loc = torch.cumsum(infer_state.b_att_len, dim=-1) - infer_state.b_att_len
-        infer_state.max_att_len_in_batch = infer_state.b_att_len.max().item()
-        infer_state.total_att_token_num = infer_state.b_att_len.sum().item()
+
+        if os.getenv('ENABLE_CACHE_DROPPING') == '1':
+            infer_state.b_att_len = [b_seq_len.clone() for layer in range(self.layers_num)]
+            infer_state.b_att_start_loc = [torch.cumsum(infer_state.b_att_len[layer], dim=-1) - infer_state.b_att_len[layer] for layer in range(self.layers_num)]
+            infer_state.max_att_len_in_batch = [infer_state.b_att_len[layer].max().item() for layer in range(self.layers_num)]
+            infer_state.total_att_token_num = [infer_state.b_att_len[layer].sum().item() for layer in range(self.layers_num)]
 
         infer_state.mem_manager = self.mem_manager
         infer_state.req_manager = self.req_manager
@@ -188,13 +191,24 @@ class TpPartBaseModel:
                             max_len_in_batch, infer_state.mem_index)
 
         if os.getenv('ENABLE_CACHE_DROPPING') == '1':
-            # 依然保留原来的分配模式，但在后续处理中忽略，同时也引入新的管理机制的分配模式
             infer_state.key_buffer = torch.empty((infer_state.total_token_num, self.tp_k_head_num_, self.head_dim_), dtype=torch.float16, device="cuda")
             infer_state.value_buffer = torch.empty((infer_state.total_token_num, self.tp_v_head_num_, self.head_dim_), dtype=torch.float16, device="cuda")  # 临时缓冲区，用于存放全序列的k/v值
-            b_cache_usage = torch.min(b_seq_len, torch.ones_like(b_seq_len) * self.req_manager.cache_size)
-            infer_state.finegrained_mem_index = self.mem_manager.alloc_finegrained(b_cache_usage.sum())  # 只为每条序列分配压缩后的缓存空间，分配的token数必须与最终选出的token数匹配
-            init_req_to_atten_indexes(self.req_manager.req_to_atten_indexs, self.req_manager.req_to_atten_scores,
-                                    b_req_idx, b_cache_usage, max_len_in_batch, infer_state.finegrained_mem_index)
+            
+            # 为每条序列分配压缩后的缓存空间，分配的token数必须与最终选出的token数匹配
+            infer_state.finegrained_mem_index = []
+            for layer in range(self.layers_num):  # 每一层需要压缩的token数都可以不一样
+                b_cache_usage = torch.min(b_seq_len, torch.ones_like(b_seq_len) * self.req_manager.layers_cache_size[layer])
+                layer_alloc_index = self.mem_manager.alloc_finegrained(layer, b_cache_usage.sum().item())
+                infer_state.finegrained_mem_index.append(layer_alloc_index)
+                start_index = 0
+                for i in range(batch_size):
+                    req_idx = b_req_idx[i].item()
+                    cache_usage = b_cache_usage[i].item()
+                    infer_state.req_manager.req_to_atten_indexs[layer][req_idx, :, 0:cache_usage] = layer_alloc_index[:, start_index:start_index+cache_usage]
+                    infer_state.req_manager.req_to_atten_indexs[layer][req_idx, :, cache_usage:] = -1
+                    infer_state.req_manager.req_to_atten_scores[layer][req_idx] = 0
+                    infer_state.req_manager.req_to_atten_times[layer][req_idx] = 0
+                    start_index += cache_usage
 
         infer_state.init_some_extra_state(self, input_ids)
         predict_logics = self._context_forward(input_ids, infer_state)
@@ -210,11 +224,13 @@ class TpPartBaseModel:
         infer_state.b_req_idx = b_req_idx
         infer_state.b_start_loc = b_start_loc
         infer_state.b_seq_len = b_seq_len
-        infer_state.b_att_len = torch.min(b_seq_len, torch.ones_like(b_seq_len) * (self.req_manager.cache_size + 1))
-        infer_state.b_att_start_loc = torch.cumsum(infer_state.b_att_len, dim=-1) - infer_state.b_att_len
-        infer_state.max_att_len_in_batch = infer_state.b_att_len.max().item()
-        infer_state.total_att_token_num = infer_state.b_att_len.sum().item()
-        
+
+        if os.getenv('ENABLE_CACHE_DROPPING') == '1':
+            infer_state.b_att_len = [torch.min(b_seq_len, torch.ones_like(b_seq_len) * (self.req_manager.layers_cache_size[layer] + 1)) for layer in range(self.layers_num)]
+            infer_state.b_att_start_loc = [torch.cumsum(infer_state.b_att_len[layer], dim=-1) - infer_state.b_att_len[layer] for layer in range(self.layers_num)]
+            infer_state.max_att_len_in_batch = [infer_state.b_att_len[layer].max().item() for layer in range(self.layers_num)]
+            infer_state.total_att_token_num = [infer_state.b_att_len[layer].sum().item() for layer in range(self.layers_num)]
+
         infer_state.mem_manager = self.mem_manager
         infer_state.req_manager = self.req_manager
 
@@ -234,14 +250,20 @@ class TpPartBaseModel:
             copy_kv_index_to_req(self.req_manager.req_to_token_indexs, b_req_idx, b_seq_len, infer_state.mem_index)
 
         if os.getenv('ENABLE_CACHE_DROPPING') == '1':
-            # 依然保留原来的分配模式，但在后续处理中忽略，同时也引入新的管理机制的分配模式
-            infer_state.finegrained_mem_index = self.mem_manager.alloc_finegrained(batch_size)
             infer_state.key_buffer = torch.empty((batch_size, self.tp_k_head_num_, self.head_dim_), dtype=torch.float16, device="cuda")
             infer_state.value_buffer = torch.empty((batch_size, self.tp_v_head_num_, self.head_dim_), dtype=torch.float16, device="cuda")  # 临时缓冲区，用于存放全序列的k/v值
-            for i in range(batch_size):
-                req_idx = b_req_idx[i]
-                att_len = infer_state.b_att_len[i]
-                self.req_manager.req_to_atten_indexs[req_idx,:,:,att_len-1] = infer_state.finegrained_mem_index[:,:,i]
+            
+            # 为每条序列分配压缩后的缓存空间，分配的token数必须与最终选出的token数匹配
+            infer_state.finegrained_mem_index = []
+            for layer in range(self.layers_num):
+                layer_alloc_index = self.mem_manager.alloc_finegrained(layer, batch_size)
+                infer_state.finegrained_mem_index.append(layer_alloc_index)
+                for i in range(batch_size):
+                    req_idx = b_req_idx[i]
+                    att_len = infer_state.b_att_len[layer][i]
+                    infer_state.req_manager.req_to_atten_indexs[layer][req_idx, :, att_len-1] = layer_alloc_index[:, i]
+                    infer_state.req_manager.req_to_atten_scores[layer][req_idx, :, att_len-1] = 0
+                    infer_state.req_manager.req_to_atten_times[layer][req_idx, :, att_len-1] = 0
 
         infer_state.init_some_extra_state(self, input_ids)
         predict_logics = self._token_forward(input_ids, infer_state)

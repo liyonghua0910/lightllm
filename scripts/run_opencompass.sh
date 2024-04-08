@@ -2,34 +2,22 @@
 
 source activate /home/mnt/liyonghua1/envs/lightllm
 
-SERVICE_NAME="full_cache" # [full_cache | top64_local64 | sink4_top64_local64 | 
-                                   # top32_local32 | top16_local16 | top8_local8 | sink4_top8_local8 | top4_local4]
-DATASETS="ceval" # [mmlu cmmlu agieval triviaqa Xsum humaneval math gsm8k]
-MODE="all" # [all | infer | eval | viz]
-WORK_DIR="./outputs/myworkspace"
-
-if [ "$SERVICE_NAME" == "full_cache" ]; then
-    SERVICE_IP="10.119.37.46"
-    REUSED_DIR="20240118_005347_internlm20b_fullcache"
-elif [ "$SERVICE_NAME" == "sink4_top64_local64" ]; then
-    SERVICE_IP="10.119.13.87"
-    REUSED_DIR="20240226_182350_internlm20b_sink4top64local64"
-elif [ "$SERVICE_NAME" == "top64_local64" ]; then
-    SERVICE_IP="10.119.17.165"
-    REUSED_DIR="20240118_103914_internlm20b_top64local64"
-elif [ "$SERVICE_NAME" == "sink4_top8_local8" ]; then
-    SERVICE_IP="10.119.4.201"
-    REUSED_DIR="20240227_010953_internlm20b_sink4top8local8"
-elif [ "$SERVICE_NAME" == "top8_local8" ]; then
-    SERVICE_IP="10.119.17.70"
-    REUSED_DIR="20240129_175629_internlm20b_top8local8"
-elif [ "$SERVICE_NAME" == "top4_local4" ]; then
-    SERVICE_IP="10.119.52.240"
-    REUSED_DIR="20240130_155152_internlm20b_top4local4"
-fi
+SERVICE_NAME="llama2_lightllm_S4T30L30_avg_skip2" # llama2_lightllm_ori
+SHOT_NUM=5
+SERVICE_IP="10.119.41.23"
+DATASETS="Xsum"    # [mmlu cmmlu agieval triviaqa Xsum humaneval math gsm8k]
+MODE="all"    # [all | infer | eval | viz]
+WORK_DIR="./outputs/exp1"
+REUSED_DIR="$(date +%Y%m%d_%H%M%S)_${SERVICE_NAME}_${SHOT_NUM}shot"
 
 cd /home/mnt/liyonghua1/opencompass
 formatted_datasets=$(echo $DATASETS | sed -E 's/[^ ]+/*&_datasets,/g')
 sed -i "s/url='.*'/url='http:\/\/$SERVICE_IP:8080\/generate'/" configs/eval_lightllm.py
+sed -i "s/abbr='.*'/abbr='$SERVICE_NAME'/" configs/eval_lightllm.py
 sed -i "s/datasets = \[.*\]/datasets = [$formatted_datasets]/" configs/eval_lightllm.py
-python run.py configs/eval_lightllm.py --work-dir $WORK_DIR --reuse $REUSED_DIR --mode $MODE --debug
+
+if test -z $REUSED_DIR; then
+    python run.py configs/eval_lightllm.py --work-dir $WORK_DIR --mode $MODE --debug
+else
+    python run.py configs/eval_lightllm.py --work-dir $WORK_DIR --mode $MODE --reuse $REUSED_DIR --debug
+fi

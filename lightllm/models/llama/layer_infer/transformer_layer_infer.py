@@ -104,8 +104,8 @@ class LlamaTransformerLayerInfer(TransformerLayerInferTpl):
     def _context_attention_kernel(self, q, k, v, infer_state:LlamaInferStateInfo, layer_weight, out=None, return_att_score=False)->torch.Tensor:
         o_tensor = torch.empty_like(q) if out is None else out
         max_seq_len = torch.max(infer_state.b_seq_len)
-        b_scaled_qk = torch.empty(infer_state.batch_size, self.tp_q_head_num_, max_seq_len, max_seq_len, dtype=torch.float16, device='cuda')
-        b_att_score = torch.empty(infer_state.batch_size, self.tp_q_head_num_, max_seq_len, dtype=torch.float16, device='cuda')
+        b_scaled_qk = torch.zeros(infer_state.batch_size, self.tp_q_head_num_, max_seq_len, max_seq_len, dtype=torch.float16, device='cuda')
+        b_att_score = torch.zeros(infer_state.batch_size, self.tp_q_head_num_, max_seq_len, dtype=torch.float16, device='cuda')
         context_attention_fwd(q.view(-1, self.tp_q_head_num_, self.head_dim_),
                               k.view(-1, self.tp_k_head_num_, self.head_dim_),
                               v.view(-1, self.tp_v_head_num_, self.head_dim_),
@@ -285,41 +285,41 @@ class LlamaTransformerLayerInfer(TransformerLayerInferTpl):
         calcu_shape1 = (batch_size, self.tp_q_head_num_, self.head_dim_)
 
         ### 缓存索引方式从req_to_token_indexs映射表替换成req_to_atten_indexs映射表
-        att_m_tensor = torch.empty((self.tp_q_head_num_, infer_state.total_att_token_num), dtype=q.dtype, device="cuda")
+        att_m_tensor = torch.empty((self.tp_q_head_num_, infer_state.total_att_token_num[self.layer_num_]), dtype=q.dtype, device="cuda")
         token_att_fwd_h2o(
             q.view(calcu_shape1),
             infer_state.mem_manager.key_buffer[self.layer_num_],
             att_m_tensor,
-            infer_state.req_manager.req_to_atten_indexs[:, self.layer_num_, :, :],
+            infer_state.req_manager.req_to_atten_indexs[self.layer_num_],
             infer_state.b_req_idx,
-            infer_state.b_att_start_loc, 
-            infer_state.b_att_len,
-            infer_state.max_att_len_in_batch,
+            infer_state.b_att_start_loc[self.layer_num_], 
+            infer_state.b_att_len[self.layer_num_],
+            infer_state.max_att_len_in_batch[self.layer_num_],
         )
 
         o_tensor = torch.empty_like(q) if out is None else out
 
         # 将返回的 qk_dot 结果转换为注意力分数
-        b_att_score = torch.empty((batch_size, self.tp_q_head_num_, infer_state.max_att_len_in_batch), dtype=torch.float16, device='cuda')
+        b_att_score = torch.zeros((batch_size, self.tp_q_head_num_, infer_state.max_att_len_in_batch[self.layer_num_]), dtype=torch.float16, device='cuda')
         for i in range(batch_size):
-            start = infer_state.b_att_start_loc[i]
-            att_len = infer_state.b_att_len[i]
+            start = infer_state.b_att_start_loc[self.layer_num_][i]
+            att_len = infer_state.b_att_len[self.layer_num_][i]
             scaled_qk = att_m_tensor[:, start:start+att_len]
             att_score = torch.softmax(scaled_qk, dim=1)
             b_att_score[i, :, :att_len] = att_score
 
         if triton.__version__ == "2.0.0":
             prob = torch.empty_like(att_m_tensor)
-            token_softmax_fwd(att_m_tensor, infer_state.b_att_start_loc, infer_state.b_att_len, prob, infer_state.max_att_len_in_batch)
+            token_softmax_fwd(att_m_tensor, infer_state.b_att_start_loc[self.layer_num_], infer_state.b_att_len[self.layer_num_], prob, infer_state.max_att_len_in_batch[self.layer_num_])
             att_m_tensor = None
             token_att_fwd2_h2o(
                 prob,
                 infer_state.mem_manager.value_buffer[self.layer_num_],
                 o_tensor.view(calcu_shape1),
-                infer_state.req_manager.req_to_atten_indexs[:, self.layer_num_, :, :],
+                infer_state.req_manager.req_to_atten_indexs[self.layer_num_],
                 infer_state.b_req_idx,
-                infer_state.b_att_start_loc, 
-                infer_state.b_att_len,
+                infer_state.b_att_start_loc[self.layer_num_], 
+                infer_state.b_att_len[self.layer_num_],
             )
             prob = None
             if return_att_score:
