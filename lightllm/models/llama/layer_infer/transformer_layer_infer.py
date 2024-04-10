@@ -104,26 +104,42 @@ class LlamaTransformerLayerInfer(TransformerLayerInferTpl):
     def _context_attention_kernel(self, q, k, v, infer_state:LlamaInferStateInfo, layer_weight, out=None, return_att_score=False)->torch.Tensor:
         o_tensor = torch.empty_like(q) if out is None else out
         max_seq_len = torch.max(infer_state.b_seq_len)
-        b_scaled_qk = torch.zeros(infer_state.batch_size, self.tp_q_head_num_, max_seq_len, max_seq_len, dtype=torch.float16, device='cuda')
-        b_att_score = torch.zeros(infer_state.batch_size, self.tp_q_head_num_, max_seq_len, dtype=torch.float16, device='cuda')
-        context_attention_fwd(q.view(-1, self.tp_q_head_num_, self.head_dim_),
-                              k.view(-1, self.tp_k_head_num_, self.head_dim_),
-                              v.view(-1, self.tp_v_head_num_, self.head_dim_),
-                              b_scaled_qk,
-                              o_tensor.view(-1, self.tp_q_head_num_, self.head_dim_),
-                              infer_state.b_start_loc,
-                              infer_state.b_seq_len,
-                              infer_state.max_len_in_batch)
+        # b_scaled_qk = torch.zeros(infer_state.batch_size, self.tp_q_head_num_, max_seq_len, max_seq_len, dtype=torch.float16, device='cuda')
+        # b_att_score = torch.zeros(infer_state.batch_size, self.tp_q_head_num_, max_seq_len, dtype=torch.float16, device='cuda')
+        # context_attention_fwd(q.view(-1, self.tp_q_head_num_, self.head_dim_),
+        #                       k.view(-1, self.tp_k_head_num_, self.head_dim_),
+        #                       v.view(-1, self.tp_v_head_num_, self.head_dim_),
+        #                       b_scaled_qk,
+        #                       o_tensor.view(-1, self.tp_q_head_num_, self.head_dim_),
+        #                       infer_state.b_start_loc,
+        #                       infer_state.b_seq_len,
+        #                       infer_state.max_len_in_batch)
 
-        # 将返回的 scaled qk dot 结果转换为注意力分数 A=softmax(QK)
+        # # 将返回的 scaled qk dot 结果转换为注意力分数 A=softmax(QK)
+        # for i in range(infer_state.batch_size):
+        #     seq_len = infer_state.b_seq_len[i]
+        #     req_idx = infer_state.b_req_idx[i]
+        #     scaled_qk = b_scaled_qk[i, :, :seq_len, :seq_len]
+        #     rows, cols = torch.triu_indices(seq_len, seq_len, offset=1)
+        #     scaled_qk[..., rows, cols] = -torch.inf
+        #     att_score = torch.softmax(scaled_qk, dim=2).sum(dim=1)
+        #     b_att_score[i, :, :seq_len] = att_score
+
+        b_att_score = torch.zeros(infer_state.batch_size, self.tp_q_head_num_, max_seq_len, dtype=torch.float16, device='cuda')
         for i in range(infer_state.batch_size):
+            start_loc = infer_state.b_start_loc[i]
             seq_len = infer_state.b_seq_len[i]
-            req_idx = infer_state.b_req_idx[i]
-            scaled_qk = b_scaled_qk[i, :, :seq_len, :seq_len]
-            rows, cols = torch.triu_indices(seq_len, seq_len, offset=1)
-            scaled_qk[..., rows, cols] = -torch.inf
-            att_score = torch.softmax(scaled_qk, dim=2).sum(dim=1)
-            b_att_score[i, :, :seq_len] = att_score
+            q_calcu = q.view(-1, self.tp_q_head_num_, self.head_dim_)[start_loc:start_loc+seq_len]
+            k_calcu = k.view(-1, self.tp_q_head_num_, self.head_dim_)[start_loc:start_loc+seq_len]
+            v_calcu = v.view(-1, self.tp_q_head_num_, self.head_dim_)[start_loc:start_loc+seq_len]
+            a_calcu = torch.matmul(q_calcu.permute(1,0,2), k_calcu.permute(1,2,0)) / torch.sqrt(torch.tensor(self.head_dim_))
+            mask = torch.zeros_like(a_calcu)
+            indx = torch.triu_indices(mask.size(1), mask.size(2), offset=1)
+            mask[:, indx[0], indx[1]] = -torch.inf
+            p_calcu = torch.softmax(a_calcu + mask, dim=-1)
+            o_calcu = torch.matmul(p_calcu, v_calcu.permute(1,0,2))
+            o_tensor[start_loc:start_loc+seq_len] = o_calcu.permute(1,0,2).reshape(seq_len, -1)
+            b_att_score[i, :, :seq_len] = p_calcu.sum(dim=1)
 
         if return_att_score:
             return b_att_score, o_tensor

@@ -14,6 +14,9 @@ from lightllm.common.build_utils import repair_config
 from lightllm.common.basemodel.triton_kernel.copy_kv_index_to_req import copy_kv_index_to_req
 from lightllm.common.basemodel.triton_kernel.splitfuse_copy_kv_index_to_req import splitfuse_copy_kv_index_to_req
 
+from lightllm.utils.log_utils import init_logger
+logger = init_logger(__name__)
+
 torch.backends.cudnn.enabled = True
 
 class TpPartBaseModel:
@@ -160,7 +163,7 @@ class TpPartBaseModel:
         infer_state.max_len_in_batch = max_len_in_batch
         assert (input_ids.shape[0] == total_token_num)
         assert (b_req_idx.shape[0] == b_start_loc.shape[0] == b_seq_len.shape[0])
-        infer_state.b_req_idx = b_req_idx
+        infer_state.b_req_idx = b_req_idx.long()
         infer_state.b_start_loc = b_start_loc
         infer_state.b_seq_len = b_seq_len
 
@@ -173,33 +176,40 @@ class TpPartBaseModel:
         infer_state.mem_manager = self.mem_manager
         infer_state.req_manager = self.req_manager
 
-        alloc_mem = self.mem_manager.alloc_contiguous(infer_state.total_token_num)
-        if alloc_mem is not None:
-            infer_state.mem_is_contiguous = True
-            infer_state.mem_index = alloc_mem[0]
-            infer_state.mem_start = alloc_mem[1]
-            infer_state.mem_end = alloc_mem[2]
+        if not os.getenv('ENABLE_CACHE_DROPPING') == '1':
+            alloc_mem = self.mem_manager.alloc_contiguous(infer_state.total_token_num)
+            if alloc_mem is not None:
+                infer_state.mem_is_contiguous = True
+                infer_state.mem_index = alloc_mem[0]
+                infer_state.mem_start = alloc_mem[1]
+                infer_state.mem_end = alloc_mem[2]
 
-        else:
-            infer_state.mem_is_contiguous = False
-            alloc_mem = self.mem_manager.alloc(infer_state.total_token_num)
-            infer_state.mem_index = alloc_mem
-            infer_state.key_buffer = torch.empty((infer_state.total_token_num, self.tp_k_head_num_, self.head_dim_), dtype=torch.float16, device="cuda")
-            infer_state.value_buffer = torch.empty((infer_state.total_token_num, self.tp_v_head_num_, self.head_dim_), dtype=torch.float16, device="cuda")
-        
-        init_req_to_token_indexes(self.req_manager.req_to_token_indexs, b_req_idx, b_seq_len,
-                            max_len_in_batch, infer_state.mem_index)
+            else:
+                infer_state.mem_is_contiguous = False
+                alloc_mem = self.mem_manager.alloc(infer_state.total_token_num)
+                infer_state.mem_index = alloc_mem
+                infer_state.key_buffer = torch.empty((infer_state.total_token_num, self.tp_k_head_num_, self.head_dim_), dtype=torch.float16, device="cuda")
+                infer_state.value_buffer = torch.empty((infer_state.total_token_num, self.tp_v_head_num_, self.head_dim_), dtype=torch.float16, device="cuda")
+            
+            init_req_to_token_indexes(self.req_manager.req_to_token_indexs, b_req_idx, b_seq_len,
+                                max_len_in_batch, infer_state.mem_index)
 
         if os.getenv('ENABLE_CACHE_DROPPING') == '1':
+            # 临时缓冲区，用于在存入cache之前暂存整个序列的kv向量
             infer_state.key_buffer = torch.empty((infer_state.total_token_num, self.tp_k_head_num_, self.head_dim_), dtype=torch.float16, device="cuda")
-            infer_state.value_buffer = torch.empty((infer_state.total_token_num, self.tp_v_head_num_, self.head_dim_), dtype=torch.float16, device="cuda")  # 临时缓冲区，用于存放全序列的k/v值
-            
+            infer_state.value_buffer = torch.empty((infer_state.total_token_num, self.tp_v_head_num_, self.head_dim_), dtype=torch.float16, device="cuda")
             # 为每条序列分配压缩后的缓存空间，分配的token数必须与最终选出的token数匹配
             infer_state.finegrained_mem_index = []
-            for layer in range(self.layers_num):  # 每一层需要压缩的token数都可以不一样
-                b_cache_usage = torch.min(b_seq_len, torch.ones_like(b_seq_len) * self.req_manager.layers_cache_size[layer])
+            for layer in range(self.layers_num):
+                # 根据目标压缩率计算每条序列需要缓存的token数量
+                b_target_len = torch.ceil(b_seq_len * self.req_manager.compression_rate).int()
+                b_target_len[b_target_len < self.req_manager.min_cache_size] = self.req_manager.min_cache_size
+                b_target_len[b_target_len > self.req_manager.max_cache_size] = self.req_manager.max_cache_size
+                b_cache_usage = torch.where(b_seq_len > self.req_manager.min_cache_size, b_target_len, b_seq_len)
+                # 为这些token分配缓存
                 layer_alloc_index = self.mem_manager.alloc_finegrained(layer, b_cache_usage.sum().item())
                 infer_state.finegrained_mem_index.append(layer_alloc_index)
+                # 初始化请求管理器中的一些状态
                 start_index = 0
                 for i in range(batch_size):
                     req_idx = b_req_idx[i].item()
@@ -208,8 +218,12 @@ class TpPartBaseModel:
                     infer_state.req_manager.req_to_atten_indexs[layer][req_idx, :, cache_usage:] = -1
                     infer_state.req_manager.req_to_atten_scores[layer][req_idx] = 0
                     infer_state.req_manager.req_to_atten_times[layer][req_idx] = 0
+                    infer_state.req_manager.req_to_cache_usage[layer][req_idx] = cache_usage
                     start_index += cache_usage
-
+                if layer == 0 and self.tp_rank_ == 0:
+                    logger.debug(f"[Prefill] batch {batch_size} total tokens {b_seq_len.sum().item()}, cached tokens {b_cache_usage.sum().item()} "
+                                 f"==> {b_cache_usage.sum().item() / b_seq_len.sum().item() * 100:.2f}%")
+                
         infer_state.init_some_extra_state(self, input_ids)
         predict_logics = self._context_forward(input_ids, infer_state)
         return predict_logics
@@ -221,12 +235,12 @@ class TpPartBaseModel:
         infer_state.total_token_num = total_token_num
         infer_state.max_len_in_batch = max_len_in_batch
         assert (b_req_idx.shape[0] == b_start_loc.shape[0] == b_seq_len.shape[0])
-        infer_state.b_req_idx = b_req_idx
+        infer_state.b_req_idx = b_req_idx.long()
         infer_state.b_start_loc = b_start_loc
         infer_state.b_seq_len = b_seq_len
 
         if os.getenv('ENABLE_CACHE_DROPPING') == '1':
-            infer_state.b_att_len = [torch.min(b_seq_len, torch.ones_like(b_seq_len) * (self.req_manager.layers_cache_size[layer] + 1)) for layer in range(self.layers_num)]
+            infer_state.b_att_len = [self.req_manager.req_to_cache_usage[layer][infer_state.b_req_idx] + 1  for layer in range(self.layers_num)]
             infer_state.b_att_start_loc = [torch.cumsum(infer_state.b_att_len[layer], dim=-1) - infer_state.b_att_len[layer] for layer in range(self.layers_num)]
             infer_state.max_att_len_in_batch = [infer_state.b_att_len[layer].max().item() for layer in range(self.layers_num)]
             infer_state.total_att_token_num = [infer_state.b_att_len[layer].sum().item() for layer in range(self.layers_num)]
@@ -234,37 +248,49 @@ class TpPartBaseModel:
         infer_state.mem_manager = self.mem_manager
         infer_state.req_manager = self.req_manager
 
-        alloc_mem = self.mem_manager.alloc_contiguous(batch_size)
-        if alloc_mem is not None:
-            infer_state.mem_is_contiguous = True
-            infer_state.mem_index = alloc_mem[0]
-            infer_state.mem_start = alloc_mem[1]
-            infer_state.mem_end = alloc_mem[2]
-            copy_kv_index_to_req(self.req_manager.req_to_token_indexs, b_req_idx, b_seq_len, infer_state.mem_index)
-        else:
-            infer_state.mem_is_contiguous = False
-            alloc_mem = self.mem_manager.alloc(batch_size)
-            infer_state.mem_index = alloc_mem
-            infer_state.key_buffer = torch.empty((batch_size, self.tp_k_head_num_, self.head_dim_), dtype=torch.float16, device="cuda")
-            infer_state.value_buffer = torch.empty((batch_size, self.tp_v_head_num_, self.head_dim_), dtype=torch.float16, device="cuda")
-            copy_kv_index_to_req(self.req_manager.req_to_token_indexs, b_req_idx, b_seq_len, infer_state.mem_index)
+        if not os.getenv('ENABLE_CACHE_DROPPING') == '1':
+            alloc_mem = self.mem_manager.alloc_contiguous(batch_size)
+            if alloc_mem is not None:
+                infer_state.mem_is_contiguous = True
+                infer_state.mem_index = alloc_mem[0]
+                infer_state.mem_start = alloc_mem[1]
+                infer_state.mem_end = alloc_mem[2]
+                copy_kv_index_to_req(self.req_manager.req_to_token_indexs, b_req_idx, b_seq_len, infer_state.mem_index)
+            else:
+                infer_state.mem_is_contiguous = False
+                alloc_mem = self.mem_manager.alloc(batch_size)
+                infer_state.mem_index = alloc_mem
+                infer_state.key_buffer = torch.empty((batch_size, self.tp_k_head_num_, self.head_dim_), dtype=torch.float16, device="cuda")
+                infer_state.value_buffer = torch.empty((batch_size, self.tp_v_head_num_, self.head_dim_), dtype=torch.float16, device="cuda")
+                copy_kv_index_to_req(self.req_manager.req_to_token_indexs, b_req_idx, b_seq_len, infer_state.mem_index)
 
         if os.getenv('ENABLE_CACHE_DROPPING') == '1':
+            # 临时缓冲区，用于在存入cache之前暂存整个序列的kv向量（在decode阶段是暂存每个序列的最新token的kv向量）
             infer_state.key_buffer = torch.empty((batch_size, self.tp_k_head_num_, self.head_dim_), dtype=torch.float16, device="cuda")
             infer_state.value_buffer = torch.empty((batch_size, self.tp_v_head_num_, self.head_dim_), dtype=torch.float16, device="cuda")  # 临时缓冲区，用于存放全序列的k/v值
-            
             # 为每条序列分配压缩后的缓存空间，分配的token数必须与最终选出的token数匹配
             infer_state.finegrained_mem_index = []
             for layer in range(self.layers_num):
+                # 根据目标压缩率计算每条序列需要缓存的token数量
+                b_target_len = torch.ceil(b_seq_len * self.req_manager.compression_rate).int()
+                b_target_len[b_target_len < self.req_manager.min_cache_size] = self.req_manager.min_cache_size
+                b_target_len[b_target_len > self.req_manager.max_cache_size] = self.req_manager.max_cache_size
+                b_cache_usage = torch.where(b_seq_len > self.req_manager.min_cache_size, b_target_len, b_seq_len)
+                # 为这些token分配缓存
                 layer_alloc_index = self.mem_manager.alloc_finegrained(layer, batch_size)
                 infer_state.finegrained_mem_index.append(layer_alloc_index)
+                # 更新请求管理器中的一些状态
                 for i in range(batch_size):
                     req_idx = b_req_idx[i]
                     att_len = infer_state.b_att_len[layer][i]
                     infer_state.req_manager.req_to_atten_indexs[layer][req_idx, :, att_len-1] = layer_alloc_index[:, i]
                     infer_state.req_manager.req_to_atten_scores[layer][req_idx, :, att_len-1] = 0
                     infer_state.req_manager.req_to_atten_times[layer][req_idx, :, att_len-1] = 0
-
+                    infer_state.req_manager.req_to_cache_usage[layer][req_idx] = b_cache_usage[i]
+                if layer == 0 and self.tp_rank_ == 0:
+                    logger.debug(f"[Decode] batch {batch_size} total tokens {b_seq_len.sum().item()}, cached tokens {b_cache_usage.sum().item()} "
+                                 f"==> {b_cache_usage.sum().item() / b_seq_len.sum().item() * 100:.2f}%")
+                
         infer_state.init_some_extra_state(self, input_ids)
         predict_logics = self._token_forward(input_ids, infer_state)
         return predict_logics

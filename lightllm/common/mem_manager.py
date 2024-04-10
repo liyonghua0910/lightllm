@@ -28,18 +28,23 @@ class MemoryManager:
         self.key_buffer = None
         self.value_buffer = None
 
+    def _check(self):
+        return ((self.finegrained_mem_state == 0) | (self.finegrained_mem_state == 1)).all()
+
     @torch.no_grad()
     def alloc_finegrained(self, layer, need_size) -> torch.Tensor:
         """ Allocate need_size memory from cache in a fine-grained manner.
             Memory state is indexed by (layer_idx, head_idx, token_idx).
             Returns a tensor shaped (layer_num, head_num, need_size).
         """
+        assert self._check()
         if (need_size > (self.finegrained_mem_state[layer] == 0).sum(-1)).any():
-            logger.warn(f'warn no enough cache size ({need_size}) in head!')
+            logger.warn(f'No enough cache size {need_size} in layer {layer}! Each head remains {(self.can_use_mem_size - self.finegrained_mem_state[layer].sum(-1)).tolist()}')
             return None
         alloc_idx = self.finegrained_mem_state[layer].sort(dim=-1, descending=False, stable=True).indices[:, :need_size]
         head_idx = torch.arange(self.head_num).unsqueeze(-1).expand_as(alloc_idx)
         self.finegrained_mem_state[layer][head_idx.flatten(), alloc_idx.flatten()] += 1
+        assert self._check()
         return alloc_idx
 
     @torch.no_grad()
@@ -48,8 +53,10 @@ class MemoryManager:
             Memory needed to be freed is specified by `free_index_list` tensor shaped (?, 3) 
             with each row looking like [layer_idx, head_idx, token_idx]
         """
+        assert self._check()
         free_index = free_index_list.long().t().tolist()
         self.finegrained_mem_state[free_index] -= 1
+        assert self._check()
         return
 
     # @torch.no_grad()

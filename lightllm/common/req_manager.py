@@ -13,21 +13,15 @@ class ReqManager:
         self.att_head_num = att_head_num
         self.layers_num = layers_num
         
-        self.cache_sink_size = int(os.getenv("CACHE_SINK_SIZE"))
-        self.cache_top_size = int(os.getenv("CACHE_TOP_SIZE"))
-        self.cache_local_size = int(os.getenv("CACHE_LOCAL_SIZE"))
-        self.cache_size = self.cache_sink_size + self.cache_top_size + self.cache_local_size
+        self.min_cache_size = int(os.getenv('MIN_CACHE_SIZE'))  # 最小的缓存长度，限制序列较长且压缩率低的情况
+        self.max_cache_size = int(os.getenv('MAX_CACHE_SIZE'))  # 最大的缓存长度，限制序列较长且压缩率高的情况
+        self.compression_rate = float(os.getenv('COMPRESSION_RATE'))  # 缓存的压缩率 = 压缩后的缓存大小 / 序列的prompt长度
 
-        # 分层压缩, 前2层不压缩, 后面层压缩为sink+top+local
-        self.layers_cache_size = [max_sequence_length] * 2 + [self.cache_size] * (layers_num - 2)
-        self.layers_cache_sink_size = [0] * 2 + [self.cache_sink_size] * (layers_num - 2)
-        self.layers_cache_top_size = [0] * 2 + [self.cache_top_size] * (layers_num - 2)
-        self.layers_cache_local_size = [max_sequence_length] * 2 + [self.cache_local_size] * (layers_num - 2)
-        
         # 为kv cache压缩维护的请求状态
-        self.req_to_atten_indexs = [torch.zeros((max_request_num, att_head_num, layer_cache_size + 1), dtype=torch.int32, device="cuda") for layer_cache_size in self.layers_cache_size]
-        self.req_to_atten_scores = [torch.zeros((max_request_num, att_head_num, layer_cache_size + 1), dtype=torch.float16, device="cuda") for layer_cache_size in self.layers_cache_size]
-        self.req_to_atten_times = [torch.zeros((max_request_num, att_head_num, layer_cache_size + 1), dtype=torch.int32, device="cuda") for layer_cache_size in self.layers_cache_size]
+        self.req_to_atten_indexs = [torch.zeros((max_request_num, att_head_num, self.max_cache_size + 1), dtype=torch.int32, device="cuda") for _ in range(layers_num)]
+        self.req_to_atten_scores = [torch.zeros((max_request_num, att_head_num, self.max_cache_size + 1), dtype=torch.float16, device="cuda") for _ in range(layers_num)]
+        self.req_to_atten_times = [torch.zeros((max_request_num, att_head_num, self.max_cache_size + 1), dtype=torch.int32, device="cuda") for _ in range(layers_num)]
+        self.req_to_cache_usage = [torch.zeros((max_request_num,), dtype=torch.int32, device='cuda') for _ in range(layers_num)]
 
     def alloc(self, need_size):
         if need_size > self.can_use_req_size:
@@ -42,9 +36,10 @@ class ReqManager:
         self.can_use_req_size += len(free_req_index)
         self.req_state[free_req_index] = 0
         for layer in range(self.layers_num):
-            self.req_to_atten_indexs[layer][free_req_index, :, :] = 0
+            self.req_to_atten_indexs[layer][free_req_index, :, :] = -1
             self.req_to_atten_scores[layer][free_req_index, :, :] = 0
             self.req_to_atten_times[layer][free_req_index, :, :] = 0
+            self.req_to_cache_usage[layer][free_req_index] = 0
         if self.can_use_req_size == len(self.req_state):
             logger.debug(f"freed all request size {self.can_use_req_size}")
         self.mem_manager.free(free_token_index)

@@ -9,7 +9,8 @@ from lightllm.utils.infer_utils import mark_cost_time
 from lightllm.common.basemodel.triton_kernel.destindex_copy_kv import destindex_copy_kv, destindex_copy_kv_finegrained
 from typing import Tuple
 
-# import debugpy; debugpy.connect(('10.119.25.81', 5678))
+if os.getenv('ENABLE_DEBUGPY') == '1':
+    import debugpy; debugpy.connect(('10.119.25.81', 5678))
 
 from lightllm.utils.log_utils import init_logger
 logger = init_logger(__name__)
@@ -96,80 +97,93 @@ class TransformerLayerInferTpl(TransformerLayerInfer):
     def _ffn(self, input, infer_state:InferStateInfo, layer_weight)->torch.Tensor:
         raise Exception("need to impl")
 
+    def _get_cache_recipe(self, b_cache_usage, recipe=None):
+        recipe = os.getenv('CACHE_RECIPE')
+        if recipe == 'H2O':
+            b_sink_usage = torch.zeros_like(b_cache_usage)
+            b_top_usage = b_cache_usage // 2
+            b_local_usage = b_cache_usage - b_top_usage
+        elif recipe == 'StreamingLLM':
+            b_sink_usage = torch.full_like(b_cache_usage, 4)
+            b_top_usage = torch.zeros_like(b_cache_usage)
+            b_local_usage = b_cache_usage - b_sink_usage
+        elif recipe == 'Hybrid':
+            b_sink_usage = torch.full_like(b_cache_usage, 4)
+            b_top_usage = (b_cache_usage - b_sink_usage) // 2
+            b_local_usage = b_cache_usage - b_sink_usage - b_top_usage
+        else:
+            raise NotImplementedError('Unsupported cache recipe! Expected one of [H2O, StreamingLLM, Hybrid]')
+        return b_sink_usage, b_top_usage, b_local_usage
+
+
     def _drop_cache(self, att_score, cache_k, cache_v, infer_state: InferStateInfo):
 
+        layer = self.layer_num_
         batch_size, head_num, _ = att_score.shape
         req_to_atten_indexs = infer_state.req_manager.req_to_atten_indexs
         req_to_atten_scores = infer_state.req_manager.req_to_atten_scores
         req_to_atten_times = infer_state.req_manager.req_to_atten_times
-
-        cache_size = infer_state.req_manager.layers_cache_size[self.layer_num_]
-        sink_size = infer_state.req_manager.layers_cache_sink_size[self.layer_num_]
-        top_size = infer_state.req_manager.layers_cache_top_size[self.layer_num_]
-        local_size = infer_state.req_manager.layers_cache_local_size[self.layer_num_]
+        req_to_cache_usage = infer_state.req_manager.req_to_cache_usage
+        
+        b_att_len = infer_state.b_att_len
+        b_req_idx = infer_state.b_req_idx.long()
+        b_start_loc = infer_state.b_start_loc
+        b_cache_usage = req_to_cache_usage[layer][b_req_idx]
 
         if infer_state.is_prefill:
-            ######## BATCH PROCESSING CODE (WITH UNKNOWN BUGS) ############################################
-            ## 批量处理不需要丢弃词的序列
             cached_kv_pos = [None for _ in range(batch_size)]
-            no_evict_req_ids = torch.nonzero(infer_state.b_att_len[self.layer_num_] <= cache_size).squeeze(-1)
+            
+            ## 批量处理不需要丢弃词的序列
+            no_evict_req_ids = torch.nonzero(b_att_len[layer] <= b_cache_usage).squeeze(-1)
             no_evict_req_num = no_evict_req_ids.numel()
             if no_evict_req_num > 0:
-                no_evict_att_len = infer_state.b_att_len[self.layer_num_][no_evict_req_ids]
+                no_evict_att_len = b_att_len[layer][no_evict_req_ids]
                 no_evict_max_att_len = no_evict_att_len.max().item()
                 no_evict_atten_score = att_score[no_evict_req_ids, :, :no_evict_max_att_len]
                 no_evict_atten_times = torch.zeros_like(no_evict_atten_score, dtype=torch.int32)
                 for i, j in enumerate(no_evict_att_len):
-                    no_evict_atten_times[i, :, :j] = torch.arange(j, 0, -1)
-
-                ## 填充各token的累积注意力分数、各token被关注的次数
-                no_evict_req_idxs = infer_state.b_req_idx[no_evict_req_ids].long()
-                req_to_atten_scores[self.layer_num_][no_evict_req_idxs, :, :no_evict_max_att_len] = no_evict_atten_score
-                req_to_atten_times[self.layer_num_][no_evict_req_idxs, :, :no_evict_max_att_len] = no_evict_atten_times
-
-                ## 收集需要缓存的kv在buffer中的位置
-                no_evict_start_loc = infer_state.b_start_loc[no_evict_req_ids]
+                    no_evict_atten_times[i, :, :j] = torch.arange(j, 0, -1).cuda()
+                # 填充各token的累积注意力分数、各token被关注的次数
+                no_evict_req_idxs = b_req_idx[no_evict_req_ids]
+                req_to_atten_scores[layer][no_evict_req_idxs, :, :no_evict_max_att_len] = no_evict_atten_score
+                req_to_atten_times[layer][no_evict_req_idxs, :, :no_evict_max_att_len] = no_evict_atten_times
+                # 收集需要缓存的kv在buffer中的位置
+                no_evict_start_loc = b_start_loc[no_evict_req_ids]
                 for i, j in enumerate(no_evict_req_ids):
-                    cached_kv_pos[j] = no_evict_start_loc[i] + torch.arange(0, no_evict_att_len[i].item(), device='cuda').repeat(head_num, 1)
+                    cached_kv_pos[j] = no_evict_start_loc[i] + torch.arange(0, no_evict_att_len[i].item()).repeat(head_num, 1).cuda()
             
             ## 批量处理需要丢弃词的序列
-            to_evict_req_ids = torch.nonzero(infer_state.b_att_len[self.layer_num_] > cache_size).squeeze(-1)
+            to_evict_req_ids = torch.nonzero(b_att_len[layer] > b_cache_usage).squeeze(-1)
             to_evict_req_num = to_evict_req_ids.numel()
             if to_evict_req_num > 0:
-                to_evict_att_len = infer_state.b_att_len[self.layer_num_][to_evict_req_ids]
+                to_evict_req_idxs = b_req_idx[to_evict_req_ids]
+                to_evict_att_len = b_att_len[layer][to_evict_req_ids]
                 to_evict_max_att_len = to_evict_att_len.max().item()
                 to_evict_atten_score = att_score[to_evict_req_ids, :, :to_evict_max_att_len]
                 to_evict_atten_times = torch.zeros_like(to_evict_atten_score, dtype=torch.int32)
                 for i, j in enumerate(to_evict_att_len):
-                    to_evict_atten_times[i, :, :j] = torch.arange(j, 0, -1)
-
-                ## 构建topk候选词的掩码: 在序列有效长度以内、非sink、非local
+                    to_evict_atten_times[i, :, :j] = torch.arange(j, 0, -1).cuda()
+                # 计算cache中各组成成分的token数量
+                to_evict_cache_usage = b_cache_usage[to_evict_req_ids]
+                to_evict_sink_usage, _, to_evict_local_usage = self._get_cache_recipe(to_evict_cache_usage)
+                # 构建topk候选词的掩码: 在序列有效长度以内、非sink、非local
                 candidate_mask = torch.zeros_like(to_evict_atten_score)
                 for i in range(to_evict_req_num):
                     candidate_mask[i, :, :to_evict_att_len[i]] = 1
-                    candidate_mask[i, :, :sink_size] = 0
-                    candidate_mask[i, :, to_evict_att_len[i]-local_size:to_evict_att_len[i]] = 0
-                assert candidate_mask.sum() == head_num * (to_evict_att_len - sink_size - local_size).sum()
-
-                ## 排序选出topk在序列中的下标，并直接生成sink和local在序列中的下标
+                    candidate_mask[i, :, :to_evict_sink_usage[i]] = -1
+                    candidate_mask[i, :, to_evict_att_len[i]-to_evict_local_usage[i]:to_evict_att_len[i]] = -1
+                # 排序选出所需要的token在当前序列中的下标
                 to_evict_redist_score = torch.where(candidate_mask == 1, to_evict_atten_score / to_evict_atten_times, -torch.inf)
-                b_h_top_pos = torch.argsort(to_evict_redist_score, descending=True, stable=True)[:,:,:top_size]
-                b_h_sink_pos = torch.arange(0, sink_size, device='cuda').repeat(to_evict_req_num, head_num, 1)
-                b_h_local_pos = torch.arange(-1, -local_size-1, -1, device='cuda').repeat(to_evict_req_num, head_num, 1) + to_evict_att_len.unsqueeze(-1).unsqueeze(-1)
-                b_h_selected_pos = torch.concat((b_h_sink_pos, b_h_top_pos, b_h_local_pos), dim=-1)
-                b_h_selected_pos = torch.sort(b_h_selected_pos, descending=False).values
-
-                ## 填充各token的累积注意力分数、填充各token被关注的次数
-                to_evict_req_idxs = infer_state.b_req_idx[to_evict_req_ids].long()
-                idx_b = torch.arange(to_evict_req_num).unsqueeze(-1).unsqueeze(-1).expand_as(b_h_selected_pos)
-                idx_h = torch.arange(head_num).unsqueeze(0).unsqueeze(-1).expand_as(b_h_selected_pos)
-                req_to_atten_scores[self.layer_num_][to_evict_req_idxs, :, :cache_size] = to_evict_atten_score[idx_b, idx_h, b_h_selected_pos]
-                req_to_atten_times[self.layer_num_][to_evict_req_idxs, :, :cache_size] = to_evict_atten_times[idx_b, idx_h, b_h_selected_pos]
-
-                ## 收集需要缓存的kv在buffer中的位置
-                to_evict_start_loc = infer_state.b_start_loc[to_evict_req_ids]
-                for i, j in enumerate(to_evict_req_ids):
-                    cached_kv_pos[j] = to_evict_start_loc[i] + b_h_selected_pos[i]
+                to_evict_redist_score = torch.where(candidate_mask == -1, torch.inf, to_evict_redist_score)
+                sorted_pos = torch.argsort(to_evict_redist_score, descending=True, stable=True)
+                # 填充各token的累积注意力分数、填充各token被关注的次数
+                for i in range(to_evict_req_num):
+                    cache_usage = to_evict_cache_usage[i]
+                    selected_pos = sorted_pos[i][:,:cache_usage].sort().values
+                    idx_h = torch.arange(head_num).unsqueeze(-1).expand_as(selected_pos).cuda()
+                    req_to_atten_scores[layer][to_evict_req_idxs[i], :, :cache_usage] = to_evict_atten_score[i][idx_h, selected_pos]
+                    req_to_atten_times[layer][to_evict_req_idxs[i], :, :cache_usage] = to_evict_atten_times[i][idx_h, selected_pos]
+                    cached_kv_pos[to_evict_req_ids[i]] = b_start_loc[to_evict_req_ids[i]] + selected_pos
             
             ## 取出真正需要缓存的kv
             cached_kv_pos = torch.concat(cached_kv_pos, dim=-1)
@@ -177,162 +191,68 @@ class TransformerLayerInferTpl(TransformerLayerInfer):
             dropped_cache_v = cache_v[cached_kv_pos, torch.arange(self.tp_v_head_num_).repeat(cached_kv_pos.shape[1], 1).t()].transpose(0,1).contiguous()
             return dropped_cache_k, dropped_cache_v
 
-            ###############################################################################################
-            
-            ######## ITERATIVE PROCESSING CODE ############################################################
-            # cached_kv_pos = [None for _ in range(batch_size)]
-            # for i in range(batch_size):
-            #     req_idx = infer_state.b_req_idx[i]
-            #     seq_len = infer_state.b_seq_len[i]
-            #     att_len = infer_state.b_att_len[self.layer_num_][i]
-            #     start_loc = infer_state.b_start_loc[i]
-            #     atten_idxs = req_to_atten_indexs[self.layer_num_][req_idx, :, :att_len].clone()
-            #     accum_score = att_score[i, :, :att_len].clone()
-            #     assert att_len == seq_len
-            #     if att_len <= cache_size:
-            #         ## 填充累积注意力分数
-            #         accum_times = torch.arange(att_len,0,-1).cuda()
-            #         req_to_atten_scores[self.layer_num_][req_idx, :, :att_len] = accum_score
-            #         req_to_atten_times[self.layer_num_][req_idx, :, :att_len] = accum_times
-            #         cached_kv_pos[i] = start_loc + torch.arange(0, att_len, device='cuda').repeat(head_num, 1)
-            #     else:
-            #         ## 如果缓存预算不够, 那么缓存由sink+top+local三部分组成
-            #         accum_times = torch.arange(att_len, 0, -1).cuda()
-            #         sorted_pos = sink_size + torch.argsort((accum_score / accum_times)[:, sink_size:att_len-local_size], descending=True, stable=True)
-            #         top_pos, evicted_pos = torch.split(sorted_pos, [top_size, att_len-cache_size], dim=1)
-            #         sink_pos = torch.arange(0, sink_size, device='cuda').repeat(head_num, 1)  # 生成sink的下标
-            #         local_pos = torch.arange(att_len-local_size, att_len, device='cuda').repeat(head_num,1)  # 生成local的下标
-            #         selected_pos = torch.concat((sink_pos, top_pos, local_pos), dim=1)
-            #         selected_pos = torch.sort(selected_pos, descending=False).values
-            #         assert selected_pos.shape == (head_num, cache_size)
-            #         cached_kv_pos[i] = start_loc + selected_pos
-
-            #         ## 填充累积注意力分数
-            #         head_index_helper = torch.arange(selected_pos.shape[0], device='cuda').repeat(selected_pos.shape[1], 1).t()
-            #         req_to_atten_scores[self.layer_num_][req_idx, :, :cache_size] = accum_score[head_index_helper, selected_pos]
-            #         req_to_atten_times[self.layer_num_][req_idx, :, :cache_size] = accum_times[selected_pos]
-    
-            # cached_kv_pos = torch.concat(cached_kv_pos, dim=-1)
-            # dropped_cache_k = cache_k[cached_kv_pos, torch.arange(self.tp_k_head_num_).repeat(cached_kv_pos.shape[1], 1).t()].transpose(0,1).contiguous()
-            # dropped_cache_v = cache_v[cached_kv_pos, torch.arange(self.tp_v_head_num_).repeat(cached_kv_pos.shape[1], 1).t()].transpose(0,1).contiguous()
-            # return dropped_cache_k, dropped_cache_v
-            # ###############################################################################################
-
-
         else:
-            ####### BATCH PROCESSING CODE ################################################################
-            ## 批量处理不需要丢弃词的序列
-            no_evict_req_ids = torch.nonzero(infer_state.b_att_len[self.layer_num_] <= cache_size).squeeze(-1)
+            # 批量处理不需要丢弃词的序列
+            no_evict_req_ids = torch.nonzero(b_att_len[layer] <= b_cache_usage).squeeze(-1)
             no_evict_req_num = no_evict_req_ids.numel()
             if no_evict_req_num > 0:
-                no_evict_req_idxs = infer_state.b_req_idx[no_evict_req_ids].long()
-                no_evict_att_len = infer_state.b_att_len[self.layer_num_][no_evict_req_ids]
-                no_evict_start_loc = infer_state.b_start_loc[no_evict_req_ids]
+                no_evict_req_idxs = b_req_idx[no_evict_req_ids]
+                no_evict_att_len = b_att_len[layer][no_evict_req_ids]
                 no_evict_max_att_len = no_evict_att_len.max().item()
                 no_evict_atten_score = att_score[no_evict_req_ids, :, :no_evict_max_att_len].clone()
-                no_evict_atten_score[:,:,:-1] += req_to_atten_scores[self.layer_num_][no_evict_req_idxs, :, :no_evict_max_att_len-1]
-                no_evict_atten_times = torch.zeros_like(no_evict_atten_score, dtype=torch.int32)
-                for i, j in enumerate(no_evict_att_len):
-                    no_evict_atten_times[i, :, :j] = torch.arange(j, 0, -1)
+                no_evict_atten_score[:,:,:-1] += req_to_atten_scores[layer][no_evict_req_idxs, :, :no_evict_max_att_len-1]
+                no_evict_atten_times = torch.ones_like(no_evict_atten_score, dtype=torch.int32)
+                no_evict_atten_times[:,:,:-1] += req_to_atten_times[layer][no_evict_req_idxs, :, :no_evict_max_att_len-1]
+                # 填充各token的累积注意力分数、填充各token被关注的次数
+                req_to_atten_scores[layer][no_evict_req_idxs, :, :no_evict_max_att_len] = no_evict_atten_score
+                req_to_atten_times [layer][no_evict_req_idxs, :, :no_evict_max_att_len] = no_evict_atten_times
 
-                ## 填充各token的累积注意力分数、填充各token被关注的次数
-                req_to_atten_scores[self.layer_num_][no_evict_req_idxs, :, :no_evict_max_att_len] = no_evict_atten_score
-                req_to_atten_times[self.layer_num_][no_evict_req_idxs, :, :no_evict_max_att_len] = no_evict_atten_times
-
-            ## 批量处理需要丢弃词的序列
-            to_evict_req_ids = torch.nonzero(infer_state.b_att_len[self.layer_num_] > cache_size).squeeze(-1)
+            # 批量处理需要丢弃词的序列
+            to_evict_req_ids = torch.nonzero(b_att_len[layer] > b_cache_usage).squeeze(-1)
             to_evict_req_num = to_evict_req_ids.numel()
             if to_evict_req_num > 0:
-                to_evict_req_idxs = infer_state.b_req_idx[to_evict_req_ids].long()
-                to_evict_att_len = infer_state.b_att_len[self.layer_num_][to_evict_req_ids]
-                to_evict_start_loc = infer_state.b_start_loc[to_evict_req_ids]
+                to_evict_req_idxs = b_req_idx[to_evict_req_ids]
+                to_evict_att_len = b_att_len[layer][to_evict_req_ids]
                 to_evict_max_att_len = to_evict_att_len.max().item()
-                to_evict_atten_indexs = req_to_atten_indexs[self.layer_num_][to_evict_req_ids, :, :to_evict_max_att_len]
+                to_evict_atten_indexs = req_to_atten_indexs[layer][to_evict_req_idxs, :, :to_evict_max_att_len]
                 to_evict_atten_score = att_score[to_evict_req_ids, :, :to_evict_max_att_len].clone()
-                to_evict_atten_score[:,:,:-1] += req_to_atten_scores[self.layer_num_][to_evict_req_idxs, :, :to_evict_max_att_len-1]
-                to_evict_atten_times = req_to_atten_times[self.layer_num_][to_evict_req_idxs, :, :to_evict_max_att_len] + 1
-                assert (to_evict_att_len == cache_size + 1).all()
-
-                ## 构建topk候选词的掩码: 在序列有效长度以内、非sink、非local
+                to_evict_atten_score[:,:,:-1] += req_to_atten_scores[layer][to_evict_req_idxs, :, :to_evict_max_att_len-1]
+                to_evict_atten_times = torch.ones_like(to_evict_atten_score, dtype=torch.int32)
+                to_evict_atten_times[:,:,:-1] += req_to_atten_times[layer][to_evict_req_idxs, :, :to_evict_max_att_len-1]
+                # 计算cache中各组成成分的token数量
+                to_evict_cache_usage = b_cache_usage[to_evict_req_ids]
+                to_evict_sink_usage, _, to_evict_local_usage = self._get_cache_recipe(to_evict_cache_usage)
+                assert (to_evict_att_len == to_evict_cache_usage + 1).all(), "在decode阶段, 缓存已满的注意力序列的长度应该恰好是缓存序列的长度加一"
+                # 构建topk候选词的掩码: 在序列有效长度以内、非sink、非local
                 candidate_mask = torch.zeros_like(to_evict_atten_score)
                 for i in range(to_evict_req_num):
                     candidate_mask[i, :, :to_evict_att_len[i]] = 1
-                    candidate_mask[i, :, :sink_size] = 0
-                    candidate_mask[i, :, to_evict_att_len[i]-local_size:to_evict_att_len[i]] = 0
-                assert candidate_mask.sum() == head_num * (to_evict_att_len - sink_size - local_size).sum()
-
-                ## 排序选出topk在序列中的下标，并直接生成sink和local在序列中的下标
+                    candidate_mask[i, :, :to_evict_sink_usage[i]] = -1
+                    candidate_mask[i, :, to_evict_att_len[i]-to_evict_local_usage[i]:to_evict_att_len[i]] = -1
+                assert (candidate_mask.count_nonzero(dim=-1) == to_evict_att_len.unsqueeze(dim=-1)).all(), "注意力序列的所有token都是候选者"
+                # 排序选出所需要的token在当前序列中的下标
                 to_evict_redist_score = torch.where(candidate_mask == 1, to_evict_atten_score / to_evict_atten_times, -torch.inf)
-                b_h_top_pos = torch.argsort(to_evict_redist_score, descending=True, stable=True)[:,:,:top_size]
-                b_h_sink_pos = torch.arange(0, sink_size, device='cuda').repeat(to_evict_req_num, head_num, 1)
-                b_h_local_pos = torch.arange(-1, -local_size-1, -1, device='cuda').repeat(to_evict_req_num, head_num, 1) + to_evict_att_len.unsqueeze(-1).unsqueeze(-1)
-                b_h_selected_pos = torch.concat((b_h_sink_pos, b_h_top_pos, b_h_local_pos), dim=-1)
-                b_h_selected_pos = torch.sort(b_h_selected_pos, descending=False).values
-                
-                ## 在缓存索引映射表更新之前，确定需要被释放的token的索引，并释放对应的缓存
-                selected_mask = torch.zeros_like(to_evict_atten_indexs)
-                idx_b = torch.arange(to_evict_req_num).unsqueeze(-1).unsqueeze(-1).expand_as(b_h_selected_pos)
-                idx_h = torch.arange(head_num).unsqueeze(0).unsqueeze(-1).expand_as(b_h_selected_pos)
-                selected_mask[idx_b, idx_h, b_h_selected_pos] = 1
-                batch_head_pos = torch.where(selected_mask==0)
-                evicted_idx = to_evict_atten_indexs[batch_head_pos]
-                free_idx = torch.stack((torch.ones_like(evicted_idx)*self.layer_num_, batch_head_pos[1], evicted_idx)).t()
-                infer_state.mem_manager.free_finegrained_by_index(free_idx)
-
-                ## 更新缓存索引映射表、更新各token的累积注意力分数、更新各token被关注的次数
-                idx_b = torch.arange(to_evict_req_num).unsqueeze(-1).unsqueeze(-1).expand_as(b_h_selected_pos)
-                idx_h = torch.arange(head_num).unsqueeze(0).unsqueeze(-1).expand_as(b_h_selected_pos)
-                req_to_atten_indexs[self.layer_num_][to_evict_req_idxs, :, :cache_size] = to_evict_atten_indexs[idx_b, idx_h, b_h_selected_pos]
-                req_to_atten_scores[self.layer_num_][to_evict_req_idxs, :, :cache_size] = to_evict_atten_score[idx_b, idx_h, b_h_selected_pos]
-                req_to_atten_times[self.layer_num_][to_evict_req_idxs, :, :cache_size] = to_evict_atten_times[idx_b, idx_h, b_h_selected_pos]
-            ##############################################################################################
-
-            ######## ITERATIVE PROCESSING CODE ############################################################
-            # for i in range(batch_size):
-            #     req_idx = infer_state.b_req_idx[i]
-            #     seq_len = infer_state.b_seq_len[i]
-            #     att_len = infer_state.b_att_len[self.layer_num_][i]
-            #     start_loc = infer_state.b_start_loc[i]
-            #     atten_idxs = req_to_atten_indexs[self.layer_num_][req_idx, :, :att_len].clone()
-            #     accum_score = att_score[i, :, :att_len].clone()
-            #     assert att_len == min(seq_len, cache_size+1)
-            #     accum_score[:, :att_len-1] += req_to_atten_scores[self.layer_num_][req_idx, :, :att_len-1]
-            #     if att_len <= cache_size:
-            #         accum_times = torch.arange(att_len,0,-1).cuda()
-            #         req_to_atten_scores[self.layer_num_][req_idx, :, :att_len] = accum_score
-            #         req_to_atten_times[self.layer_num_][req_idx, :, :att_len] = accum_times
-            #     else:
-            #         assert att_len == cache_size + 1
-            #         ## 如果缓存预算达到限制, 那么缓存由sink+top+local三部分组成
-            #         accum_times = req_to_atten_times[self.layer_num_][req_idx, :, :att_len] + 1
-            #         sorted_pos = sink_size + torch.argsort((accum_score / accum_times)[:, sink_size:att_len-local_size], descending=True, stable=True)
-            #         top_pos, evicted_pos = torch.split(sorted_pos, [top_size, att_len-cache_size], dim=1)
-            #         sink_pos = torch.arange(0, sink_size, device='cuda').repeat(head_num, 1)  # 生成sink的下标
-            #         local_pos = torch.arange(att_len-local_size, att_len, device='cuda').repeat(head_num,1)  # 生成local的下标
-            #         selected_pos = torch.concat((sink_pos, top_pos, local_pos), dim=1)
-            #         selected_pos = torch.sort(selected_pos, descending=False).values
-            #         assert selected_pos.shape == (head_num, cache_size)
-
-            #         ## 在缓存索引映射表更新之前，确定需要被释放的token的索引
-            #         layer_index_helper = torch.ones_like(evicted_pos, device='cuda') * self.layer_num_
-            #         head_index_helper = torch.arange(evicted_pos.shape[0], device='cuda').repeat(evicted_pos.shape[1], 1).t()
-            #         evicted_idx = atten_idxs[head_index_helper, evicted_pos]
-            #         free_idx = torch.stack((layer_index_helper, head_index_helper, evicted_idx), dim=-1).view(-1,3)
-                
-            #         ## 更新缓存索引映射表和累积注意力分数
-            #         head_index_helper = torch.arange(selected_pos.shape[0], device='cuda').repeat(selected_pos.shape[1], 1).t()
-            #         req_to_atten_indexs[self.layer_num_][req_idx, :, :cache_size] = atten_idxs[head_index_helper, selected_pos] # token_idxs[selected_pos]
-            #         req_to_atten_scores[self.layer_num_][req_idx, :, :cache_size] = accum_score[head_index_helper, selected_pos]
-            #         req_to_atten_times [self.layer_num_][req_idx, :, :cache_size] = accum_times[head_index_helper, selected_pos]
-            #         req_to_atten_indexs[self.layer_num_][req_idx, :, cache_size:] = 0
-            #         req_to_atten_scores[self.layer_num_][req_idx, :, cache_size:] = 0.0
-            #         req_to_atten_times [self.layer_num_][req_idx, :, cache_size:] = 0
-
-            #         ## 释放掉被丢弃的token的对应缓存
-            #         infer_state.mem_manager.free_finegrained_by_index(free_idx)
-            ###############################################################################################
-
-
+                to_evict_redist_score = torch.where(candidate_mask == -1, torch.inf, to_evict_redist_score)
+                sorted_pos = torch.argsort(to_evict_redist_score, descending=True, stable=True)
+                # 在缓存索引映射表更新之前，确定需要被释放的token的索引，并释放对应的缓存
+                # 然后更新缓存索引映射表、更新各token的累积注意力分数、更新各token被关注的次数
+                for i in range(to_evict_req_num):
+                    att_len = to_evict_att_len[i]
+                    cache_usage = to_evict_cache_usage[i]
+                    selected_pos = sorted_pos[i, :, :cache_usage].sort().values
+                    evicted_pos = sorted_pos[i, :, cache_usage:att_len]
+                    assert evicted_pos.size(-1) == 1, "在decode阶段, 缓存已满的序列的只需要驱逐一个token"
+                    idx_h = torch.arange(head_num).unsqueeze(-1).expand_as(evicted_pos).cuda()
+                    evicted_idx = to_evict_atten_indexs[i, idx_h, evicted_pos]
+                    free_idx = torch.stack([torch.full_like(evicted_pos, layer), idx_h, evicted_idx]).view(3,-1).transpose(0,1)
+                    assert (infer_state.mem_manager.finegrained_mem_state[free_idx.long().t().tolist()] == 1).all(), "必须已经被占用的缓存位置才能被释放"
+                    infer_state.mem_manager.free_finegrained_by_index(free_idx)
+                    idx_h = torch.arange(head_num).unsqueeze(-1).expand_as(selected_pos).cuda()
+                    req_to_atten_indexs[layer][to_evict_req_idxs[i], :, :cache_usage] = to_evict_atten_indexs[i, idx_h, selected_pos]
+                    req_to_atten_scores[layer][to_evict_req_idxs[i], :, :cache_usage] = to_evict_atten_score[i, idx_h, selected_pos]
+                    req_to_atten_times[layer][to_evict_req_idxs[i], :, :cache_usage] = to_evict_atten_times[i, idx_h, selected_pos]
+            
+            return None, None
 
     @mark_cost_time("trans context flash forward time cost")  # dont to remove this, will make performence down, did not know why
     def _context_attention(self, input_embding, infer_state: InferStateInfo, layer_weight):

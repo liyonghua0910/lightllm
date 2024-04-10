@@ -2,13 +2,16 @@
 
 source activate /home/mnt/liyonghua1/envs/lightllm
 
-SERVICE_NAME="llama2_lightllm_S4T30L30_avg_skip2" # llama2_lightllm_ori
-SHOT_NUM=5
-SERVICE_IP="10.119.41.23"
-DATASETS="Xsum"    # [mmlu cmmlu agieval triviaqa Xsum humaneval math gsm8k]
+SERVICE_NAME="llama2_7b_hybrid"  # llama2_lightllm_ori
+SERVICE_IP="10.119.56.45"
+DATASETS="Xsum humaneval gsm8k"    # [mmlu cmmlu agieval triviaqa Xsum humaneval math gsm8k]
 MODE="all"    # [all | infer | eval | viz]
 WORK_DIR="./outputs/exp1"
-REUSED_DIR="$(date +%Y%m%d_%H%M%S)_${SERVICE_NAME}_${SHOT_NUM}shot"
+REUSED_DIR="$(date +%Y%m%d_%H%M%S)_${SERVICE_NAME}"
+# REUSED_DIR="20240410_001534_llama2_7b_hybrid"
+# 20240408_190658_llama2_7b_fullcache
+# 20240409_224107_llama2_7b_h2o
+# 20240410_001534_llama2_7b_hybrid
 
 cd /home/mnt/liyonghua1/opencompass
 formatted_datasets=$(echo $DATASETS | sed -E 's/[^ ]+/*&_datasets,/g')

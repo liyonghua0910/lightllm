@@ -143,14 +143,14 @@ class InferBatch:
             req : InferReq = requests_mapping.pop(request_id)
             free_req_index.append(req.req_idx)
             free_token_index.append(self.req_manager.req_to_token_indexs[req.req_idx][:req.cur_kv_len])
-            for layer, layer_cache_size in enumerate(self.req_manager.layers_cache_size):
+            for layer in range(self.req_manager.layers_num):
                 for head in range(self.req_manager.att_head_num):
-                    free_indices_in_head = self.req_manager.req_to_atten_indexs[layer][req.req_idx, head, :min(layer_cache_size, req.cur_kv_len)]
-                    free_indices_formatted = torch.stack((
-                        torch.ones_like(free_indices_in_head)*layer, torch.ones_like(free_indices_in_head)*head, free_indices_in_head)).t()
-                    free_atten_index.append(free_indices_formatted)
+                    cache_usage = self.req_manager.req_to_cache_usage[layer][req.req_idx]
+                    free_indices = self.req_manager.req_to_atten_indexs[layer][req.req_idx, head, :cache_usage]
+                    for free_idx in free_indices:
+                        free_atten_index.append([layer, head, free_idx])
         free_token_index = torch.cat(free_token_index, dim=-1)
-        free_atten_index = torch.cat(free_atten_index)
+        free_atten_index = torch.tensor(free_atten_index)
         self.req_manager.free(free_req_index, free_token_index, free_atten_index)
         if len(requests_mapping) == 0:
             requests_mapping.clear()
@@ -176,14 +176,14 @@ class InferBatch:
             req : InferReq = requests_mapping.pop(request_id)
             free_req_index.append(req.req_idx)
             free_token_index.append(self.req_manager.req_to_token_indexs[req.req_idx][:req.cur_kv_len])
-            for layer, layer_cache_size in enumerate(self.req_manager.layers_cache_size):
+            for layer in range(self.req_manager.layers_num):
                 for head in range(self.req_manager.att_head_num):
-                    free_indices_in_head = self.req_manager.req_to_atten_indexs[layer][req.req_idx, head, :min(layer_cache_size, req.cur_kv_len)]
-                    free_indices_formatted = torch.stack((
-                        torch.ones_like(free_indices_in_head)*layer, torch.ones_like(free_indices_in_head)*head, free_indices_in_head)).t()
-                    free_atten_index.append(free_indices_formatted)
+                    cache_usage = self.req_manager.req_to_cache_usage[layer][req.req_idx]
+                    free_indices = self.req_manager.req_to_atten_indexs[layer][req.req_idx, head, :cache_usage]
+                    for free_idx in free_indices:
+                        free_atten_index.append([layer, head, free_idx])
         free_token_index = torch.cat(free_token_index, dim=-1)
-        free_atten_index = torch.cat(free_atten_index)
+        free_atten_index = torch.tensor(free_atten_index)
         self.req_manager.free(free_req_index, free_token_index, free_atten_index)
         
         return InferBatch(
