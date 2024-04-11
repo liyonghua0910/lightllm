@@ -150,6 +150,7 @@ class RouterManager:
                     token_ratio = total_used_tokens / self.max_total_token_num
                     logger.debug(
                         f"current batch size: {len(self.running_batch.reqs)} " 
+                        f"cached tokens: {self.running_batch.batch_used_tokens} "   
                         f"paused req num: {len(self.req_queue.pause_req_dict)} "
                         f"token used ratio: {token_ratio} "
                     )
@@ -199,7 +200,7 @@ class RouterManager:
             # pause strategy
             paused_reqs = select_paused_reqs(self.running_batch, self.pause_strategy, self.req_queue, self.max_total_token_num)
             await self._pause_reqs(self.running_batch, paused_reqs)
-            logger.debug(f"pasued req num: {len(self.req_queue.pause_req_dict)}")
+            logger.debug(f"paused req num: {len(self.req_queue.pause_req_dict)}")
             self.has_wait_tokens = 0
             return
         return

@@ -109,6 +109,7 @@ class ReqQueue:
                 aborted_count += 1
                 continue
             req_first_router_need_tokens = req.get_first_router_need_tokens()
+            # 前面的条件是用来检测当前系统内的所有请求在后续推理中是否有危险，后面的条件是用来探测new batch的tokens数量有没有超过一个batch内的限制
             if self._can_add_new_req(req, is_busy) and cur_batch_decode_need_tokens + new_batch_first_router_need_tokens + req_first_router_need_tokens <= self.batch_max_tokens:
                 can_run_list.append(req)
                 new_batch_first_router_need_tokens += req_first_router_need_tokens

@@ -2,6 +2,8 @@ from .sampling_params import SamplingParams
 from typing import Dict, List, Optional, Tuple
 import asyncio
 import enum
+import math
+import os
 
 class ReqRunStatus(enum.Enum):
     WAIT_IN_QUEUE = 0 # 在队列中等待
@@ -76,6 +78,17 @@ class NormalReq(Req):
         super().__init__(request_id, prompt_ids, sample_params, prompt_cache_len, prompt_cache_req_id)
         return
     
+    def get_compressed_len(self, seq_len):
+        max_cache_size = int(os.getenv('MAX_CACHE_SIZE'))
+        min_cache_size = int(os.getenv('MIN_CACHE_SIZE'))
+        compression_rate = float(os.getenv('COMPRESSION_RATE'))
+        return min(max_cache_size, max(min_cache_size, math.ceil(seq_len * compression_rate))) if seq_len > min_cache_size else seq_len
+
+    def get_used_tokens(self):
+        if os.getenv('ENABLE_CACHE_DROPPING') == '1':
+            return self.get_compressed_len(self.input_len + len(self.output_ids))
+        return max(0, self.cur_kv_len - self.prompt_cache_len)
+    
     def get_tuple_tokens(self, is_busy, router_max_new_token_len):
         """
         普通continues batch调度模式, 先prefill 后 decode 的估计方式 的实现
@@ -90,6 +103,17 @@ class NormalReq(Req):
             # 后续会更新为更合理的统计条件概率估计方式 to do
             cur_max_new_token_len = min(self.max_output_len, max(int(1.1 * has_out_len), router_max_new_token_len))
 
+        if os.getenv('ENABLE_CACHE_DROPPING') == '1':
+            cached_tokens = self.get_compressed_len(self.input_len + has_out_len)
+            to_cache_tokens = self.get_compressed_len(self.input_len + self.max_output_len)
+
+            if self.req_status == ReqRunStatus.RUNNING or self.req_status == ReqRunStatus.PAUSED_AND_KVKEEP:
+                return cached_tokens, to_cache_tokens + 1 - cached_tokens
+            elif self.req_status == ReqRunStatus.WAIT_IN_QUEUE or self.req_status == ReqRunStatus.PAUSED_AND_OFFLOAD:
+                return cached_tokens + 1, to_cache_tokens + 1 - cached_tokens - 1
+            else:
+                assert False, "error state"
+
         if self.req_status == ReqRunStatus.RUNNING:
             return (self.input_len + has_out_len - self.prompt_cache_len, max(0, cur_max_new_token_len - has_out_len - 1))
         elif self.req_status == ReqRunStatus.WAIT_IN_QUEUE:
@@ -103,12 +127,32 @@ class NormalReq(Req):
         return
     
     def get_decode_need_tokens(self):
+        if os.getenv('ENABLE_CACHE_DROPPING') == '1':
+            has_out_len = len(self.output_ids)
+            cached_tokens = self.get_compressed_len(self.input_len + has_out_len)
+            to_cache_tokens = self.get_compressed_len(self.input_len + has_out_len + 1)
+            if self.req_status == ReqRunStatus.RUNNING:
+                return to_cache_tokens - cached_tokens
+            else:
+                assert False, "error state"
+
         if self.req_status == ReqRunStatus.RUNNING:
             return 1
         else:
             assert False, "error state"
     
     def get_first_router_need_tokens(self):
+        if os.getenv('ENABLE_CACHE_DROPPING') == '1':
+            has_out_len = len(self.output_ids)
+            if self.req_status == ReqRunStatus.WAIT_IN_QUEUE:
+                return self.get_compressed_len(self.input_len)
+            elif self.req_status == ReqRunStatus.PAUSED_AND_OFFLOAD:
+                return self.get_compressed_len(self.input_len + has_out_len)
+            elif self.req_status == ReqRunStatus.PAUSED_AND_KVKEEP:
+                return 0
+            else:
+                assert False, "error state"
+
         if self.req_status == ReqRunStatus.WAIT_IN_QUEUE:
             return self.input_len
         elif self.req_status == ReqRunStatus.PAUSED_AND_OFFLOAD:
