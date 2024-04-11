@@ -19,8 +19,8 @@ class ReqManager:
 
         # 为kv cache压缩维护的请求状态
         self.req_to_atten_indexs = [torch.zeros((max_request_num, att_head_num, self.max_cache_size + 1), dtype=torch.int32, device="cuda") for _ in range(layers_num)]
-        self.req_to_atten_scores = [torch.zeros((max_request_num, att_head_num, self.max_cache_size + 1), dtype=torch.float16, device="cuda") for _ in range(layers_num)]
-        self.req_to_atten_times = [torch.zeros((max_request_num, att_head_num, self.max_cache_size + 1), dtype=torch.int32, device="cuda") for _ in range(layers_num)]
+        self.req_to_cum_scores = [torch.zeros((max_request_num, att_head_num, self.max_cache_size + 1), dtype=torch.float16, device="cuda") for _ in range(layers_num)]
+        self.req_to_cum_times = [torch.zeros((max_request_num, att_head_num, self.max_cache_size + 1), dtype=torch.int32, device="cuda") for _ in range(layers_num)]
         self.req_to_cache_usage = [torch.zeros((max_request_num,), dtype=torch.int32, device='cuda') for _ in range(layers_num)]
 
     def alloc(self, need_size):
@@ -37,8 +37,8 @@ class ReqManager:
         self.req_state[free_req_index] = 0
         for layer in range(self.layers_num):
             self.req_to_atten_indexs[layer][free_req_index, :, :] = -1
-            self.req_to_atten_scores[layer][free_req_index, :, :] = 0
-            self.req_to_atten_times[layer][free_req_index, :, :] = 0
+            self.req_to_cum_scores[layer][free_req_index, :, :] = 0
+            self.req_to_cum_times[layer][free_req_index, :, :] = 0
             self.req_to_cache_usage[layer][free_req_index] = 0
         if self.can_use_req_size == len(self.req_state):
             logger.debug(f"freed all request size {self.can_use_req_size}")

@@ -216,13 +216,13 @@ class TpPartBaseModel:
                     cache_usage = b_cache_usage[i].item()
                     infer_state.req_manager.req_to_atten_indexs[layer][req_idx, :, 0:cache_usage] = layer_alloc_index[:, start_index:start_index+cache_usage]
                     infer_state.req_manager.req_to_atten_indexs[layer][req_idx, :, cache_usage:] = -1
-                    infer_state.req_manager.req_to_atten_scores[layer][req_idx] = 0
-                    infer_state.req_manager.req_to_atten_times[layer][req_idx] = 0
+                    infer_state.req_manager.req_to_cum_scores[layer][req_idx] = 0
+                    infer_state.req_manager.req_to_cum_times[layer][req_idx] = 0
                     infer_state.req_manager.req_to_cache_usage[layer][req_idx] = cache_usage
                     start_index += cache_usage
-                if layer == 0 and self.tp_rank_ == 0:
-                    logger.debug(f"[Prefill] batch {batch_size} total tokens {b_seq_len.sum().item()}, cached tokens {b_cache_usage.sum().item()} "
-                                 f"==> {b_cache_usage.sum().item() / b_seq_len.sum().item() * 100:.2f}%")
+                # if layer == 0 and self.tp_rank_ == 0:
+                #     logger.debug(f"[Prefill] batch {batch_size} total tokens {b_seq_len.sum().item()}, cached tokens {b_cache_usage.sum().item()} "
+                #                  f"==> {b_cache_usage.sum().item() / b_seq_len.sum().item() * 100:.2f}%")
                 
         infer_state.init_some_extra_state(self, input_ids)
         predict_logics = self._context_forward(input_ids, infer_state)
@@ -284,12 +284,12 @@ class TpPartBaseModel:
                     req_idx = b_req_idx[i]
                     att_len = infer_state.b_att_len[layer][i]
                     infer_state.req_manager.req_to_atten_indexs[layer][req_idx, :, att_len-1] = layer_alloc_index[:, i]
-                    infer_state.req_manager.req_to_atten_scores[layer][req_idx, :, att_len-1] = 0
-                    infer_state.req_manager.req_to_atten_times[layer][req_idx, :, att_len-1] = 0
+                    infer_state.req_manager.req_to_cum_scores[layer][req_idx, :, att_len-1] = 0
+                    infer_state.req_manager.req_to_cum_times[layer][req_idx, :, att_len-1] = 0
                     infer_state.req_manager.req_to_cache_usage[layer][req_idx] = b_cache_usage[i]
-                if layer == 0 and self.tp_rank_ == 0:
-                    logger.debug(f"[Decode] batch {batch_size} total tokens {b_seq_len.sum().item()}, cached tokens {b_cache_usage.sum().item()} "
-                                 f"==> {b_cache_usage.sum().item() / b_seq_len.sum().item() * 100:.2f}%")
+                # if layer == 0 and self.tp_rank_ == 0:
+                #     logger.debug(f"[Decode] batch {batch_size} total tokens {b_seq_len.sum().item()}, cached tokens {b_cache_usage.sum().item()} "
+                #                  f"==> {b_cache_usage.sum().item() / b_seq_len.sum().item() * 100:.2f}%")
                 
         infer_state.init_some_extra_state(self, input_ids)
         predict_logics = self._token_forward(input_ids, infer_state)

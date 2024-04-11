@@ -115,14 +115,24 @@ class TransformerLayerInferTpl(TransformerLayerInfer):
             raise NotImplementedError('Unsupported cache recipe! Expected one of [H2O, StreamingLLM, Hybrid]')
         return b_sink_usage, b_top_usage, b_local_usage
 
+    def _get_score_for_sort(self, cur_score, cum_score, atten_times):
+        sort_by = os.getenv('ATTENTION_SORT_BY')
+        if sort_by == 'average':
+            return cum_score / atten_times
+        elif sort_by == 'cummulative':
+            return cum_score
+        elif sort_by == 'volatile':
+            return cur_score
+        else:
+            raise NotImplementedError('Unsupported sorting policy! Expected one of [average, cummulative, volatile]')
 
-    def _drop_cache(self, att_score, cache_k, cache_v, infer_state: InferStateInfo):
+    def _drop_cache(self, cur_score, cum_score, cache_k, cache_v, infer_state: InferStateInfo):
 
         layer = self.layer_num_
-        batch_size, head_num, _ = att_score.shape
+        batch_size, head_num, _ = cur_score.shape
         req_to_atten_indexs = infer_state.req_manager.req_to_atten_indexs
-        req_to_atten_scores = infer_state.req_manager.req_to_atten_scores
-        req_to_atten_times = infer_state.req_manager.req_to_atten_times
+        req_to_cum_scores = infer_state.req_manager.req_to_cum_scores
+        req_to_cum_times = infer_state.req_manager.req_to_cum_times
         req_to_cache_usage = infer_state.req_manager.req_to_cache_usage
         
         b_att_len = infer_state.b_att_len
@@ -139,14 +149,14 @@ class TransformerLayerInferTpl(TransformerLayerInfer):
             if no_evict_req_num > 0:
                 no_evict_att_len = b_att_len[layer][no_evict_req_ids]
                 no_evict_max_att_len = no_evict_att_len.max().item()
-                no_evict_atten_score = att_score[no_evict_req_ids, :, :no_evict_max_att_len]
-                no_evict_atten_times = torch.zeros_like(no_evict_atten_score, dtype=torch.int32)
+                no_evict_cum_score = cum_score[no_evict_req_ids, :, :no_evict_max_att_len]
+                no_evict_cum_times = torch.zeros_like(no_evict_cum_score, dtype=torch.int32)
                 for i, j in enumerate(no_evict_att_len):
-                    no_evict_atten_times[i, :, :j] = torch.arange(j, 0, -1).cuda()
+                    no_evict_cum_times[i, :, :j] = torch.arange(j, 0, -1).cuda()
                 # 填充各token的累积注意力分数、各token被关注的次数
                 no_evict_req_idxs = b_req_idx[no_evict_req_ids]
-                req_to_atten_scores[layer][no_evict_req_idxs, :, :no_evict_max_att_len] = no_evict_atten_score
-                req_to_atten_times[layer][no_evict_req_idxs, :, :no_evict_max_att_len] = no_evict_atten_times
+                req_to_cum_scores[layer][no_evict_req_idxs, :, :no_evict_max_att_len] = no_evict_cum_score
+                req_to_cum_times[layer][no_evict_req_idxs, :, :no_evict_max_att_len] = no_evict_cum_times
                 # 收集需要缓存的kv在buffer中的位置
                 no_evict_start_loc = b_start_loc[no_evict_req_ids]
                 for i, j in enumerate(no_evict_req_ids):
@@ -159,30 +169,32 @@ class TransformerLayerInferTpl(TransformerLayerInfer):
                 to_evict_req_idxs = b_req_idx[to_evict_req_ids]
                 to_evict_att_len = b_att_len[layer][to_evict_req_ids]
                 to_evict_max_att_len = to_evict_att_len.max().item()
-                to_evict_atten_score = att_score[to_evict_req_ids, :, :to_evict_max_att_len]
-                to_evict_atten_times = torch.zeros_like(to_evict_atten_score, dtype=torch.int32)
+                to_evict_cur_score = cur_score[to_evict_req_ids, :, :to_evict_max_att_len]
+                to_evict_cum_score = cum_score[to_evict_req_ids, :, :to_evict_max_att_len]
+                to_evict_cum_times = torch.zeros_like(to_evict_cum_score, dtype=torch.int32)
                 for i, j in enumerate(to_evict_att_len):
-                    to_evict_atten_times[i, :, :j] = torch.arange(j, 0, -1).cuda()
+                    to_evict_cum_times[i, :, :j] = torch.arange(j, 0, -1).cuda()
                 # 计算cache中各组成成分的token数量
                 to_evict_cache_usage = b_cache_usage[to_evict_req_ids]
                 to_evict_sink_usage, _, to_evict_local_usage = self._get_cache_recipe(to_evict_cache_usage)
                 # 构建topk候选词的掩码: 在序列有效长度以内、非sink、非local
-                candidate_mask = torch.zeros_like(to_evict_atten_score)
+                candidate_mask = torch.zeros_like(to_evict_cum_score)
                 for i in range(to_evict_req_num):
                     candidate_mask[i, :, :to_evict_att_len[i]] = 1
                     candidate_mask[i, :, :to_evict_sink_usage[i]] = -1
                     candidate_mask[i, :, to_evict_att_len[i]-to_evict_local_usage[i]:to_evict_att_len[i]] = -1
                 # 排序选出所需要的token在当前序列中的下标
-                to_evict_redist_score = torch.where(candidate_mask == 1, to_evict_atten_score / to_evict_atten_times, -torch.inf)
-                to_evict_redist_score = torch.where(candidate_mask == -1, torch.inf, to_evict_redist_score)
-                sorted_pos = torch.argsort(to_evict_redist_score, descending=True, stable=True)
+                to_evict_score_for_sort = self._get_score_for_sort(to_evict_cur_score, to_evict_cum_score, to_evict_cum_times)
+                to_evict_score_for_sort = torch.where(candidate_mask == 1, to_evict_score_for_sort, -torch.inf)
+                to_evict_score_for_sort = torch.where(candidate_mask == -1, torch.inf, to_evict_score_for_sort)
+                to_evict_sorted_pos = torch.argsort(to_evict_score_for_sort, descending=True, stable=True)
                 # 填充各token的累积注意力分数、填充各token被关注的次数
                 for i in range(to_evict_req_num):
                     cache_usage = to_evict_cache_usage[i]
-                    selected_pos = sorted_pos[i][:,:cache_usage].sort().values
+                    selected_pos = to_evict_sorted_pos[i][:,:cache_usage].sort().values
                     idx_h = torch.arange(head_num).unsqueeze(-1).expand_as(selected_pos).cuda()
-                    req_to_atten_scores[layer][to_evict_req_idxs[i], :, :cache_usage] = to_evict_atten_score[i][idx_h, selected_pos]
-                    req_to_atten_times[layer][to_evict_req_idxs[i], :, :cache_usage] = to_evict_atten_times[i][idx_h, selected_pos]
+                    req_to_cum_scores[layer][to_evict_req_idxs[i], :, :cache_usage] = to_evict_cum_score[i][idx_h, selected_pos]
+                    req_to_cum_times[layer][to_evict_req_idxs[i], :, :cache_usage] = to_evict_cum_times[i][idx_h, selected_pos]
                     cached_kv_pos[to_evict_req_ids[i]] = b_start_loc[to_evict_req_ids[i]] + selected_pos
             
             ## 取出真正需要缓存的kv
@@ -192,6 +204,7 @@ class TransformerLayerInferTpl(TransformerLayerInfer):
             return dropped_cache_k, dropped_cache_v
 
         else:
+            assert cum_score == None
             # 批量处理不需要丢弃词的序列
             no_evict_req_ids = torch.nonzero(b_att_len[layer] <= b_cache_usage).squeeze(-1)
             no_evict_req_num = no_evict_req_ids.numel()
@@ -199,13 +212,13 @@ class TransformerLayerInferTpl(TransformerLayerInfer):
                 no_evict_req_idxs = b_req_idx[no_evict_req_ids]
                 no_evict_att_len = b_att_len[layer][no_evict_req_ids]
                 no_evict_max_att_len = no_evict_att_len.max().item()
-                no_evict_atten_score = att_score[no_evict_req_ids, :, :no_evict_max_att_len].clone()
-                no_evict_atten_score[:,:,:-1] += req_to_atten_scores[layer][no_evict_req_idxs, :, :no_evict_max_att_len-1]
-                no_evict_atten_times = torch.ones_like(no_evict_atten_score, dtype=torch.int32)
-                no_evict_atten_times[:,:,:-1] += req_to_atten_times[layer][no_evict_req_idxs, :, :no_evict_max_att_len-1]
+                no_evict_cum_score = cur_score[no_evict_req_ids, :, :no_evict_max_att_len].clone()
+                no_evict_cum_score[:,:,:-1] += req_to_cum_scores[layer][no_evict_req_idxs, :, :no_evict_max_att_len-1]
+                no_evict_cum_times = torch.ones_like(no_evict_cum_score, dtype=torch.int32)
+                no_evict_cum_times[:,:,:-1] += req_to_cum_times[layer][no_evict_req_idxs, :, :no_evict_max_att_len-1]
                 # 填充各token的累积注意力分数、填充各token被关注的次数
-                req_to_atten_scores[layer][no_evict_req_idxs, :, :no_evict_max_att_len] = no_evict_atten_score
-                req_to_atten_times [layer][no_evict_req_idxs, :, :no_evict_max_att_len] = no_evict_atten_times
+                req_to_cum_scores[layer][no_evict_req_idxs, :, :no_evict_max_att_len] = no_evict_cum_score
+                req_to_cum_times[layer][no_evict_req_idxs, :, :no_evict_max_att_len] = no_evict_cum_times
 
             # 批量处理需要丢弃词的序列
             to_evict_req_ids = torch.nonzero(b_att_len[layer] > b_cache_usage).squeeze(-1)
@@ -215,32 +228,34 @@ class TransformerLayerInferTpl(TransformerLayerInfer):
                 to_evict_att_len = b_att_len[layer][to_evict_req_ids]
                 to_evict_max_att_len = to_evict_att_len.max().item()
                 to_evict_atten_indexs = req_to_atten_indexs[layer][to_evict_req_idxs, :, :to_evict_max_att_len]
-                to_evict_atten_score = att_score[to_evict_req_ids, :, :to_evict_max_att_len].clone()
-                to_evict_atten_score[:,:,:-1] += req_to_atten_scores[layer][to_evict_req_idxs, :, :to_evict_max_att_len-1]
-                to_evict_atten_times = torch.ones_like(to_evict_atten_score, dtype=torch.int32)
-                to_evict_atten_times[:,:,:-1] += req_to_atten_times[layer][to_evict_req_idxs, :, :to_evict_max_att_len-1]
+                to_evict_cur_score = cur_score[to_evict_req_ids, :, :to_evict_max_att_len].clone()
+                to_evict_cum_score = cur_score[to_evict_req_ids, :, :to_evict_max_att_len].clone()
+                to_evict_cum_score[:,:,:-1] += req_to_cum_scores[layer][to_evict_req_idxs, :, :to_evict_max_att_len-1]
+                to_evict_cum_times = torch.ones_like(to_evict_cum_score, dtype=torch.int32)
+                to_evict_cum_times[:,:,:-1] += req_to_cum_times[layer][to_evict_req_idxs, :, :to_evict_max_att_len-1]
                 # 计算cache中各组成成分的token数量
                 to_evict_cache_usage = b_cache_usage[to_evict_req_ids]
                 to_evict_sink_usage, _, to_evict_local_usage = self._get_cache_recipe(to_evict_cache_usage)
                 assert (to_evict_att_len == to_evict_cache_usage + 1).all(), "在decode阶段, 缓存已满的注意力序列的长度应该恰好是缓存序列的长度加一"
                 # 构建topk候选词的掩码: 在序列有效长度以内、非sink、非local
-                candidate_mask = torch.zeros_like(to_evict_atten_score)
+                candidate_mask = torch.zeros_like(to_evict_cum_score)
                 for i in range(to_evict_req_num):
                     candidate_mask[i, :, :to_evict_att_len[i]] = 1
                     candidate_mask[i, :, :to_evict_sink_usage[i]] = -1
                     candidate_mask[i, :, to_evict_att_len[i]-to_evict_local_usage[i]:to_evict_att_len[i]] = -1
                 assert (candidate_mask.count_nonzero(dim=-1) == to_evict_att_len.unsqueeze(dim=-1)).all(), "注意力序列的所有token都是候选者"
                 # 排序选出所需要的token在当前序列中的下标
-                to_evict_redist_score = torch.where(candidate_mask == 1, to_evict_atten_score / to_evict_atten_times, -torch.inf)
-                to_evict_redist_score = torch.where(candidate_mask == -1, torch.inf, to_evict_redist_score)
-                sorted_pos = torch.argsort(to_evict_redist_score, descending=True, stable=True)
+                to_evict_score_for_sort = self._get_score_for_sort(to_evict_cur_score, to_evict_cum_score, to_evict_cum_times)
+                to_evict_score_for_sort = torch.where(candidate_mask == 1, to_evict_score_for_sort, -torch.inf)
+                to_evict_score_for_sort = torch.where(candidate_mask == -1, torch.inf, to_evict_score_for_sort)
+                to_evict_sorted_pos = torch.argsort(to_evict_score_for_sort, descending=True, stable=True)
                 # 在缓存索引映射表更新之前，确定需要被释放的token的索引，并释放对应的缓存
                 # 然后更新缓存索引映射表、更新各token的累积注意力分数、更新各token被关注的次数
                 for i in range(to_evict_req_num):
                     att_len = to_evict_att_len[i]
                     cache_usage = to_evict_cache_usage[i]
-                    selected_pos = sorted_pos[i, :, :cache_usage].sort().values
-                    evicted_pos = sorted_pos[i, :, cache_usage:att_len]
+                    selected_pos = to_evict_sorted_pos[i, :, :cache_usage].sort().values
+                    evicted_pos = to_evict_sorted_pos[i, :, cache_usage:att_len]
                     assert evicted_pos.size(-1) == 1, "在decode阶段, 缓存已满的序列的只需要驱逐一个token"
                     idx_h = torch.arange(head_num).unsqueeze(-1).expand_as(evicted_pos).cuda()
                     evicted_idx = to_evict_atten_indexs[i, idx_h, evicted_pos]
@@ -249,8 +264,8 @@ class TransformerLayerInferTpl(TransformerLayerInfer):
                     infer_state.mem_manager.free_finegrained_by_index(free_idx)
                     idx_h = torch.arange(head_num).unsqueeze(-1).expand_as(selected_pos).cuda()
                     req_to_atten_indexs[layer][to_evict_req_idxs[i], :, :cache_usage] = to_evict_atten_indexs[i, idx_h, selected_pos]
-                    req_to_atten_scores[layer][to_evict_req_idxs[i], :, :cache_usage] = to_evict_atten_score[i, idx_h, selected_pos]
-                    req_to_atten_times[layer][to_evict_req_idxs[i], :, :cache_usage] = to_evict_atten_times[i, idx_h, selected_pos]
+                    req_to_cum_scores[layer][to_evict_req_idxs[i], :, :cache_usage] = to_evict_cum_score[i, idx_h, selected_pos]
+                    req_to_cum_times[layer][to_evict_req_idxs[i], :, :cache_usage] = to_evict_cum_times[i, idx_h, selected_pos]
             
             return None, None
 
@@ -274,11 +289,12 @@ class TransformerLayerInferTpl(TransformerLayerInfer):
         cache_k, cache_v = self._pre_cache_kv(infer_state, layer_weight)
         q, cache_k, cache_v  = self._get_qkv(input1, cache_k, cache_v, infer_state, layer_weight)
         input1 = None
-        att_score, o = self._context_attention_kernel(q, cache_k, cache_v, infer_state, layer_weight, return_att_score=True)
+        cur_score, cum_score, o = self._context_attention_kernel(q, cache_k, cache_v, infer_state, layer_weight, return_att_score=True)
         q = None
-        dropped_cache_k, dropped_cache_v = self._drop_cache(att_score, cache_k, cache_v, infer_state)
+        dropped_cache_k, dropped_cache_v = self._drop_cache(cur_score, cum_score, cache_k, cache_v, infer_state)
         self._post_cache_kv(dropped_cache_k, dropped_cache_v, infer_state, layer_weight)  # 直接存入压缩后的kv
-        att_score = None
+        cur_score = None
+        cum_score = None
         o = self._get_o(o, infer_state, layer_weight)
         if self.world_size_ > 1:
             dist.all_reduce(o, op=dist.ReduceOp.SUM, async_op=False)
@@ -316,10 +332,11 @@ class TransformerLayerInferTpl(TransformerLayerInfer):
         q, cache_k, cache_v = self._get_qkv(input1, cache_k, cache_v, infer_state, layer_weight)
         input1 = None
         self._post_cache_kv(cache_k, cache_v, infer_state, layer_weight) # 先把当前tokens的kv值存进cache
-        att_score, o = self._token_attention_kernel(q, infer_state, layer_weight, return_att_score=True) # 计算attention
+        cur_score, cum_score, o = self._token_attention_kernel(q, infer_state, layer_weight, return_att_score=True) # 计算attention
         q = None
-        self._drop_cache(att_score, cache_k, cache_v, infer_state)
-        att_score = None
+        self._drop_cache(cur_score, cum_score, cache_k, cache_v, infer_state)
+        cur_score = None
+        cum_score = None
         o = self._get_o(o, infer_state, layer_weight)
         if self.world_size_ > 1:
             dist.all_reduce(o, op=dist.ReduceOp.SUM, async_op=False)

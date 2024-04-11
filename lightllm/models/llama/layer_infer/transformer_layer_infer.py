@@ -125,7 +125,8 @@ class LlamaTransformerLayerInfer(TransformerLayerInferTpl):
         #     att_score = torch.softmax(scaled_qk, dim=2).sum(dim=1)
         #     b_att_score[i, :, :seq_len] = att_score
 
-        b_att_score = torch.zeros(infer_state.batch_size, self.tp_q_head_num_, max_seq_len, dtype=torch.float16, device='cuda')
+        b_cur_score = torch.zeros(infer_state.batch_size, self.tp_q_head_num_, max_seq_len, dtype=torch.float16, device='cuda')
+        b_cum_score = torch.zeros(infer_state.batch_size, self.tp_q_head_num_, max_seq_len, dtype=torch.float16, device='cuda')
         for i in range(infer_state.batch_size):
             start_loc = infer_state.b_start_loc[i]
             seq_len = infer_state.b_seq_len[i]
@@ -139,10 +140,11 @@ class LlamaTransformerLayerInfer(TransformerLayerInferTpl):
             p_calcu = torch.softmax(a_calcu + mask, dim=-1)
             o_calcu = torch.matmul(p_calcu, v_calcu.permute(1,0,2))
             o_tensor[start_loc:start_loc+seq_len] = o_calcu.permute(1,0,2).reshape(seq_len, -1)
-            b_att_score[i, :, :seq_len] = p_calcu.sum(dim=1)
+            b_cum_score[i, :, :seq_len] = p_calcu.sum(dim=1)
+            b_cur_score[i, :, :seq_len] = p_calcu[:,-1,:]
 
         if return_att_score:
-            return b_att_score, o_tensor
+            return b_cur_score, b_cum_score, o_tensor
         else:
             return o_tensor
 
@@ -316,13 +318,13 @@ class LlamaTransformerLayerInfer(TransformerLayerInferTpl):
         o_tensor = torch.empty_like(q) if out is None else out
 
         # 将返回的 qk_dot 结果转换为注意力分数
-        b_att_score = torch.zeros((batch_size, self.tp_q_head_num_, infer_state.max_att_len_in_batch[self.layer_num_]), dtype=torch.float16, device='cuda')
+        b_cur_score = torch.zeros((batch_size, self.tp_q_head_num_, infer_state.max_att_len_in_batch[self.layer_num_]), dtype=torch.float16, device='cuda')
         for i in range(batch_size):
             start = infer_state.b_att_start_loc[self.layer_num_][i]
             att_len = infer_state.b_att_len[self.layer_num_][i]
             scaled_qk = att_m_tensor[:, start:start+att_len]
             att_score = torch.softmax(scaled_qk, dim=1)
-            b_att_score[i, :, :att_len] = att_score
+            b_cur_score[i, :, :att_len] = att_score
 
         if triton.__version__ == "2.0.0":
             prob = torch.empty_like(att_m_tensor)
@@ -339,7 +341,7 @@ class LlamaTransformerLayerInfer(TransformerLayerInferTpl):
             )
             prob = None
             if return_att_score:
-                return b_att_score, o_tensor
+                return b_cur_score, None, o_tensor
             else:
                 return o_tensor
         # elif triton.__version__ >= "2.1.0":
