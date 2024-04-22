@@ -154,11 +154,11 @@ class ModelRpcServer(rpyc.Service):
             ans[req_id] = (req_obj.req_status, req_obj.cur_kv_len)
         return ans
     
-    @calculate_time(show=False, min_cost_ms=300)
+    @calculate_time(show=True, min_cost_ms=10)
     def exposed_prefill_batch(self, batch_id):
         return self.forward(batch_id, is_prefill=True)
 
-    @calculate_time(show=True, min_cost_ms=200)
+    @calculate_time(show=True, min_cost_ms=10)
     def exposed_decode_batch(self, batch_id):
         if self.is_splitfuse_mode:
             return self.splitfuse_forward(batch_id)

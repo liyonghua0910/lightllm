@@ -6,7 +6,10 @@ import numpy as np
 from typing import Tuple
 from functools import partial
 import triton
-
+import time
+if os.getenv('ENABLE_DEBUGPY') == '1':
+    import debugpy; debugpy.connect(('10.119.17.48', 5678))
+    
 from lightllm.models.llama.layer_weights.transformer_layer_weight import LlamaTransformerLayerWeight
 from lightllm.models.llama.triton_kernel.context_flashattention_nopad import context_attention_fwd
 from lightllm.models.llama.triton_kernel.token_attention_nopad_att1 import token_att_fwd, token_att_fwd_h2o, token_att_fwd_int8k
@@ -103,45 +106,29 @@ class LlamaTransformerLayerInfer(TransformerLayerInferTpl):
     
     def _context_attention_kernel(self, q, k, v, infer_state:LlamaInferStateInfo, layer_weight, out=None, return_att_score=False)->torch.Tensor:
         o_tensor = torch.empty_like(q) if out is None else out
-        max_seq_len = torch.max(infer_state.b_seq_len)
-        # b_scaled_qk = torch.zeros(infer_state.batch_size, self.tp_q_head_num_, max_seq_len, max_seq_len, dtype=torch.float16, device='cuda')
-        # b_att_score = torch.zeros(infer_state.batch_size, self.tp_q_head_num_, max_seq_len, dtype=torch.float16, device='cuda')
-        # context_attention_fwd(q.view(-1, self.tp_q_head_num_, self.head_dim_),
-        #                       k.view(-1, self.tp_k_head_num_, self.head_dim_),
-        #                       v.view(-1, self.tp_v_head_num_, self.head_dim_),
-        #                       b_scaled_qk,
-        #                       o_tensor.view(-1, self.tp_q_head_num_, self.head_dim_),
-        #                       infer_state.b_start_loc,
-        #                       infer_state.b_seq_len,
-        #                       infer_state.max_len_in_batch)
+        b_cur_score = torch.zeros([infer_state.batch_size, self.tp_q_head_num_, infer_state.max_len_in_batch], dtype=torch.float16, device="cuda")
+        b_cum_score = torch.zeros([infer_state.batch_size, self.tp_q_head_num_, infer_state.max_len_in_batch], dtype=torch.float16, device="cuda")
+        context_attention_fwd(q.view(-1, self.tp_q_head_num_, self.head_dim_),
+                            k.view(-1, self.tp_k_head_num_, self.head_dim_),
+                            v.view(-1, self.tp_v_head_num_, self.head_dim_),
+                            b_cur_score,
+                            b_cum_score,
+                            o_tensor.view(-1, self.tp_q_head_num_, self.head_dim_),
+                            infer_state.b_start_loc,
+                            infer_state.b_seq_len,
+                            infer_state.max_len_in_batch)
 
-        # # 将返回的 scaled qk dot 结果转换为注意力分数 A=softmax(QK)
-        # for i in range(infer_state.batch_size):
-        #     seq_len = infer_state.b_seq_len[i]
-        #     req_idx = infer_state.b_req_idx[i]
-        #     scaled_qk = b_scaled_qk[i, :, :seq_len, :seq_len]
-        #     rows, cols = torch.triu_indices(seq_len, seq_len, offset=1)
-        #     scaled_qk[..., rows, cols] = -torch.inf
-        #     att_score = torch.softmax(scaled_qk, dim=2).sum(dim=1)
-        #     b_att_score[i, :, :seq_len] = att_score
-
-        b_cur_score = torch.zeros(infer_state.batch_size, self.tp_q_head_num_, max_seq_len, dtype=torch.float16, device='cuda')
-        b_cum_score = torch.zeros(infer_state.batch_size, self.tp_q_head_num_, max_seq_len, dtype=torch.float16, device='cuda')
-        for i in range(infer_state.batch_size):
-            start_loc = infer_state.b_start_loc[i]
-            seq_len = infer_state.b_seq_len[i]
-            q_calcu = q.view(-1, self.tp_q_head_num_, self.head_dim_)[start_loc:start_loc+seq_len]
-            k_calcu = k.view(-1, self.tp_q_head_num_, self.head_dim_)[start_loc:start_loc+seq_len]
-            v_calcu = v.view(-1, self.tp_q_head_num_, self.head_dim_)[start_loc:start_loc+seq_len]
-            a_calcu = torch.matmul(q_calcu.permute(1,0,2), k_calcu.permute(1,2,0)) / torch.sqrt(torch.tensor(self.head_dim_))
-            mask = torch.zeros_like(a_calcu)
-            indx = torch.triu_indices(mask.size(1), mask.size(2), offset=1)
-            mask[:, indx[0], indx[1]] = -torch.inf
-            p_calcu = torch.softmax(a_calcu + mask, dim=-1)
-            o_calcu = torch.matmul(p_calcu, v_calcu.permute(1,0,2))
-            o_tensor[start_loc:start_loc+seq_len] = o_calcu.permute(1,0,2).reshape(seq_len, -1)
-            b_cum_score[i, :, :seq_len] = p_calcu.sum(dim=1)
-            b_cur_score[i, :, :seq_len] = p_calcu[:,-1,:]
+        if os.getenv('ENABLE_CACHE_DROPPING') == '1' and os.getenv('ENABLE_CACHE_REALLOCATION') == '1':
+            # 计算注意力密度
+            for i in range(infer_state.batch_size):
+                seq_len = infer_state.b_seq_len[i]
+                req_idx = infer_state.b_req_idx[i]
+                score = b_cur_score[i, :, :seq_len]
+                density = torch.count_nonzero(score >= 1 / seq_len) / torch.numel(score)
+                if self.world_size_ > 1:
+                    dist.all_reduce(density, op=dist.ReduceOp.SUM, async_op=False)
+                    density /= self.world_size_
+                infer_state.req_manager.req_to_layer_density[req_idx, self.layer_num_] = density
 
         if return_att_score:
             return b_cur_score, b_cum_score, o_tensor
@@ -326,38 +313,25 @@ class LlamaTransformerLayerInfer(TransformerLayerInferTpl):
             att_score = torch.softmax(scaled_qk, dim=1)
             b_cur_score[i, :, :att_len] = att_score
 
-        if triton.__version__ == "2.0.0":
-            prob = torch.empty_like(att_m_tensor)
-            token_softmax_fwd(att_m_tensor, infer_state.b_att_start_loc[self.layer_num_], infer_state.b_att_len[self.layer_num_], prob, infer_state.max_att_len_in_batch[self.layer_num_])
-            att_m_tensor = None
-            token_att_fwd2_h2o(
-                prob,
-                infer_state.mem_manager.value_buffer[self.layer_num_],
-                o_tensor.view(calcu_shape1),
-                infer_state.req_manager.req_to_atten_indexs[self.layer_num_],
-                infer_state.b_req_idx,
-                infer_state.b_att_start_loc[self.layer_num_], 
-                infer_state.b_att_len[self.layer_num_],
-            )
-            prob = None
-            if return_att_score:
-                return b_cur_score, None, o_tensor
-            else:
-                return o_tensor
-        # elif triton.__version__ >= "2.1.0":
-        #     from lightllm.models.llama.triton_kernel.token_attention_softmax_and_reducev import token_softmax_reducev_fwd
-        #     token_softmax_reducev_fwd(att_m_tensor, 
-        #                               infer_state.mem_manager.value_buffer[self.layer_num_],
-        #                               o_tensor.view(calcu_shape1),
-        #                               infer_state.req_manager.req_to_token_indexs,
-        #                               infer_state.b_req_idx,
-        #                               infer_state.b_start_loc,
-        #                               infer_state.b_seq_len,
-        #                               infer_state.other_kv_index)
-        #     return o_tensor
+        prob = torch.empty_like(att_m_tensor)
+        token_softmax_fwd(att_m_tensor, infer_state.b_att_start_loc[self.layer_num_], infer_state.b_att_len[self.layer_num_], prob, infer_state.max_att_len_in_batch[self.layer_num_])
+        att_m_tensor = None
+        token_att_fwd2_h2o(
+            prob,
+            infer_state.mem_manager.value_buffer[self.layer_num_],
+            o_tensor.view(calcu_shape1),
+            infer_state.req_manager.req_to_atten_indexs[self.layer_num_],
+            infer_state.b_req_idx,
+            infer_state.b_att_start_loc[self.layer_num_], 
+            infer_state.b_att_len[self.layer_num_],
+        )
+        prob = None
+        if return_att_score:
+            return b_cur_score, None, o_tensor
         else:
-            raise Exception("not support triton version")
-    
+            return o_tensor
+
+
     def _token_decode_gqa_attention_normal(self, q, infer_state: LlamaInferStateInfo, layer_weight, out=None):
         batch_size = infer_state.batch_size
         calcu_shape1 = (batch_size, self.tp_q_head_num_, self.head_dim_)

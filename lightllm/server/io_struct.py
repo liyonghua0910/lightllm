@@ -82,7 +82,7 @@ class NormalReq(Req):
         max_cache_size = int(os.getenv('MAX_CACHE_SIZE'))
         min_cache_size = int(os.getenv('MIN_CACHE_SIZE'))
         compression_rate = float(os.getenv('COMPRESSION_RATE'))
-        return min(max_cache_size, max(min_cache_size, math.ceil(seq_len * compression_rate))) if seq_len > min_cache_size else seq_len
+        return min(self.input_len + self.max_output_len, max_cache_size) # min(max_cache_size, max(min_cache_size, math.ceil(seq_len * compression_rate))) if seq_len > min_cache_size else seq_len
 
     def get_used_tokens(self):
         if os.getenv('ENABLE_CACHE_DROPPING') == '1':

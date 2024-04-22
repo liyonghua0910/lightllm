@@ -48,14 +48,14 @@ class MemoryManager:
         return alloc_idx
 
     @torch.no_grad()
-    def free_finegrained_by_index(self, free_index_list):
+    def free_finegrained_by_index(self, free_indices):
         """ Free memory from cache in a fine-grained manner.
-            Memory needed to be freed is specified by `free_index_list` tensor shaped (?, 3) 
-            with each row looking like [layer_idx, head_idx, token_idx]
+            Memory needed to be freed is specified by a tuple of indices (layer_idx, head_idx, token_idx),
+            indicating the layer index, head index and memory index of each evicted token.
         """
         assert self._check()
-        free_index = free_index_list.long().t().tolist()
-        self.finegrained_mem_state[free_index] -= 1
+        free_indices = [i.long() for i in free_indices]
+        self.finegrained_mem_state[free_indices] -= 1
         assert self._check()
         return
 

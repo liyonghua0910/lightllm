@@ -13,6 +13,7 @@ from lightllm.common.infer_utils import init_req_to_token_indexes
 from lightllm.common.build_utils import repair_config
 from lightllm.common.basemodel.triton_kernel.copy_kv_index_to_req import copy_kv_index_to_req
 from lightllm.common.basemodel.triton_kernel.splitfuse_copy_kv_index_to_req import splitfuse_copy_kv_index_to_req
+import time
 
 from lightllm.utils.log_utils import init_logger
 logger = init_logger(__name__)
@@ -153,7 +154,25 @@ class TpPartBaseModel:
         else:
             return self._decode(batch_size, total_token_num, max_len_in_batch, input_ids, b_req_idx, b_start_loc, b_seq_len)
 
-    
+    def _get_cache_budget(self, infer_state:infer_state_class) -> torch.Tensor:
+        """ 根据实际序列长度推算预期的缓存序列长度 """
+        b_seq_len = infer_state.b_seq_len
+        b_req_idx = infer_state.b_req_idx
+        req_manager = infer_state.req_manager
+        # 根据目标压缩率计算每条序列需要缓存的token数量，默认每层都相同
+        lb_cache_budget = torch.ceil(b_seq_len * req_manager.compression_rate).repeat(self.layers_num, 1)
+        # 在decode阶段，根据各层的注意力密度调整每条序列在各层中需要缓存的token数量
+        if not infer_state.is_prefill and os.getenv('ENABLE_CACHE_REALLOCATION') == '1':
+            lb_scale = req_manager.req_to_layer_density[b_req_idx, :].softmax(dim=-1).transpose(0,1)
+            lb_cache_budget = torch.round(lb_scale * self.layers_num * lb_cache_budget).int()
+        # 缓存长度受到上下界的限制
+        lb_cache_budget[lb_cache_budget < req_manager.min_cache_size] = req_manager.min_cache_size
+        lb_cache_budget[lb_cache_budget > req_manager.max_cache_size] = req_manager.max_cache_size
+        # 如果序列本身长度过短则无需压缩
+        lb_cache_budget = torch.where(b_seq_len > req_manager.min_cache_size, lb_cache_budget, b_seq_len)
+        lb_cache_budget = lb_cache_budget.int()
+        return lb_cache_budget
+
     def _prefill(self, batch_size, total_token_num, max_len_in_batch, input_ids, b_req_idx, b_start_loc, b_seq_len):
         infer_state = self.infer_state_class()
         infer_state.is_prefill = True
@@ -195,35 +214,30 @@ class TpPartBaseModel:
                                 max_len_in_batch, infer_state.mem_index)
 
         if os.getenv('ENABLE_CACHE_DROPPING') == '1':
+            TIMER = time.perf_counter()
             # 临时缓冲区，用于在存入cache之前暂存整个序列的kv向量
             infer_state.key_buffer = torch.empty((infer_state.total_token_num, self.tp_k_head_num_, self.head_dim_), dtype=torch.float16, device="cuda")
             infer_state.value_buffer = torch.empty((infer_state.total_token_num, self.tp_v_head_num_, self.head_dim_), dtype=torch.float16, device="cuda")
             # 为每条序列分配压缩后的缓存空间，分配的token数必须与最终选出的token数匹配
-            infer_state.finegrained_mem_index = []
+            infer_state.finegrained_mem_index = [None for _ in range(self.layers_num)]
+            lb_cache_budget = self._get_cache_budget(infer_state)
             for layer in range(self.layers_num):
-                # 根据目标压缩率计算每条序列需要缓存的token数量
-                b_target_len = torch.ceil(b_seq_len * self.req_manager.compression_rate).int()
-                b_target_len[b_target_len < self.req_manager.min_cache_size] = self.req_manager.min_cache_size
-                b_target_len[b_target_len > self.req_manager.max_cache_size] = self.req_manager.max_cache_size
-                b_cache_usage = torch.where(b_seq_len > self.req_manager.min_cache_size, b_target_len, b_seq_len)
-                # 为这些token分配缓存
-                layer_alloc_index = self.mem_manager.alloc_finegrained(layer, b_cache_usage.sum().item())
-                infer_state.finegrained_mem_index.append(layer_alloc_index)
+                # 为需要缓存的token分配缓存
+                layer_alloc_index = self.mem_manager.alloc_finegrained(layer, lb_cache_budget[layer].sum().item())
+                infer_state.finegrained_mem_index[layer] = layer_alloc_index
                 # 初始化请求管理器中的一些状态
                 start_index = 0
                 for i in range(batch_size):
                     req_idx = b_req_idx[i].item()
-                    cache_usage = b_cache_usage[i].item()
-                    infer_state.req_manager.req_to_atten_indexs[layer][req_idx, :, 0:cache_usage] = layer_alloc_index[:, start_index:start_index+cache_usage]
-                    infer_state.req_manager.req_to_atten_indexs[layer][req_idx, :, cache_usage:] = -1
+                    cache_budget = lb_cache_budget[layer, i].item()
+                    infer_state.req_manager.req_to_atten_indexs[layer][req_idx, :, :cache_budget] = layer_alloc_index[:, start_index:start_index+cache_budget]
+                    infer_state.req_manager.req_to_atten_indexs[layer][req_idx, :, cache_budget:] = -1
                     infer_state.req_manager.req_to_cum_scores[layer][req_idx] = 0
                     infer_state.req_manager.req_to_cum_times[layer][req_idx] = 0
-                    infer_state.req_manager.req_to_cache_usage[layer][req_idx] = cache_usage
-                    start_index += cache_usage
-                # if layer == 0 and self.tp_rank_ == 0:
-                #     logger.debug(f"[Prefill] batch {batch_size} total tokens {b_seq_len.sum().item()}, cached tokens {b_cache_usage.sum().item()} "
-                #                  f"==> {b_cache_usage.sum().item() / b_seq_len.sum().item() * 100:.2f}%")
-                
+                    infer_state.req_manager.req_to_cache_budget[layer][req_idx] = cache_budget
+                    start_index += cache_budget
+            logger.debug(f"[prefill] allocate fine-grained cache {lb_cache_budget[layer].tolist()} takes {(time.perf_counter() - TIMER)*1000:.2f} ms")
+
         infer_state.init_some_extra_state(self, input_ids)
         predict_logics = self._context_forward(input_ids, infer_state)
         return predict_logics
@@ -240,7 +254,7 @@ class TpPartBaseModel:
         infer_state.b_seq_len = b_seq_len
 
         if os.getenv('ENABLE_CACHE_DROPPING') == '1':
-            infer_state.b_att_len = [self.req_manager.req_to_cache_usage[layer][infer_state.b_req_idx] + 1  for layer in range(self.layers_num)]
+            infer_state.b_att_len = [self.req_manager.req_to_cache_usage[layer][infer_state.b_req_idx] + 1 for layer in range(self.layers_num)]
             infer_state.b_att_start_loc = [torch.cumsum(infer_state.b_att_len[layer], dim=-1) - infer_state.b_att_len[layer] for layer in range(self.layers_num)]
             infer_state.max_att_len_in_batch = [infer_state.b_att_len[layer].max().item() for layer in range(self.layers_num)]
             infer_state.total_att_token_num = [infer_state.b_att_len[layer].sum().item() for layer in range(self.layers_num)]
@@ -269,28 +283,19 @@ class TpPartBaseModel:
             infer_state.key_buffer = torch.empty((batch_size, self.tp_k_head_num_, self.head_dim_), dtype=torch.float16, device="cuda")
             infer_state.value_buffer = torch.empty((batch_size, self.tp_v_head_num_, self.head_dim_), dtype=torch.float16, device="cuda")  # 临时缓冲区，用于存放全序列的k/v值
             # 为每条序列分配压缩后的缓存空间，分配的token数必须与最终选出的token数匹配
-            infer_state.finegrained_mem_index = []
+            infer_state.finegrained_mem_index = [None for _ in range(self.layers_num)]
+            cache_budget = self._get_cache_budget(infer_state)
             for layer in range(self.layers_num):
-                # 根据目标压缩率计算每条序列需要缓存的token数量
-                b_target_len = torch.ceil(b_seq_len * self.req_manager.compression_rate).int()
-                b_target_len[b_target_len < self.req_manager.min_cache_size] = self.req_manager.min_cache_size
-                b_target_len[b_target_len > self.req_manager.max_cache_size] = self.req_manager.max_cache_size
-                b_cache_usage = torch.where(b_seq_len > self.req_manager.min_cache_size, b_target_len, b_seq_len)
-                # 为这些token分配缓存
+                # 为新的token分配缓存
                 layer_alloc_index = self.mem_manager.alloc_finegrained(layer, batch_size)
-                infer_state.finegrained_mem_index.append(layer_alloc_index)
+                infer_state.finegrained_mem_index[layer] = layer_alloc_index
                 # 更新请求管理器中的一些状态
-                for i in range(batch_size):
-                    req_idx = b_req_idx[i]
-                    att_len = infer_state.b_att_len[layer][i]
-                    infer_state.req_manager.req_to_atten_indexs[layer][req_idx, :, att_len-1] = layer_alloc_index[:, i]
-                    infer_state.req_manager.req_to_cum_scores[layer][req_idx, :, att_len-1] = 0
-                    infer_state.req_manager.req_to_cum_times[layer][req_idx, :, att_len-1] = 0
-                    infer_state.req_manager.req_to_cache_usage[layer][req_idx] = b_cache_usage[i]
-                # if layer == 0 and self.tp_rank_ == 0:
-                #     logger.debug(f"[Decode] batch {batch_size} total tokens {b_seq_len.sum().item()}, cached tokens {b_cache_usage.sum().item()} "
-                #                  f"==> {b_cache_usage.sum().item() / b_seq_len.sum().item() * 100:.2f}%")
-                
+                b_att_len = infer_state.b_att_len[layer].long()
+                infer_state.req_manager.req_to_atten_indexs[layer][infer_state.b_req_idx, :, b_att_len - 1] = layer_alloc_index.transpose(0,1).int()
+                infer_state.req_manager.req_to_cum_scores[layer][infer_state.b_req_idx, :, b_att_len - 1] = 0
+                infer_state.req_manager.req_to_cum_times[layer][infer_state.b_req_idx, :, b_att_len - 1] = 0
+                infer_state.req_manager.req_to_cache_budget[layer][infer_state.b_req_idx] = cache_budget[layer]
+
         infer_state.init_some_extra_state(self, input_ids)
         predict_logics = self._token_forward(input_ids, infer_state)
         return predict_logics

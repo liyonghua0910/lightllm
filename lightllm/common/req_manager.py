@@ -22,6 +22,8 @@ class ReqManager:
         self.req_to_cum_scores = [torch.zeros((max_request_num, att_head_num, self.max_cache_size + 1), dtype=torch.float16, device="cuda") for _ in range(layers_num)]
         self.req_to_cum_times = [torch.zeros((max_request_num, att_head_num, self.max_cache_size + 1), dtype=torch.int32, device="cuda") for _ in range(layers_num)]
         self.req_to_cache_usage = [torch.zeros((max_request_num,), dtype=torch.int32, device='cuda') for _ in range(layers_num)]
+        self.req_to_cache_budget = [torch.zeros((max_request_num,), dtype=torch.int32, device='cuda') for _ in range(layers_num)]
+        self.req_to_layer_density = torch.zeros((max_request_num, layers_num), dtype=torch.float16, device='cuda')
 
     def alloc(self, need_size):
         if need_size > self.can_use_req_size:
@@ -40,6 +42,8 @@ class ReqManager:
             self.req_to_cum_scores[layer][free_req_index, :, :] = 0
             self.req_to_cum_times[layer][free_req_index, :, :] = 0
             self.req_to_cache_usage[layer][free_req_index] = 0
+            self.req_to_cache_budget[layer][free_req_index] = 0
+            self.req_to_layer_density[free_req_index, :] = 0
         if self.can_use_req_size == len(self.req_state):
             logger.debug(f"freed all request size {self.can_use_req_size}")
         self.mem_manager.free(free_token_index)
